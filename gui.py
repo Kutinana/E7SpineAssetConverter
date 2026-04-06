@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import (
     END, DISABLED, NORMAL, WORD,
@@ -22,7 +23,8 @@ from tkinter import (
 from sct2png import convert_sct_to_png
 from scsp2json import convert_scsp_to_json
 
-VERSION = "1.0.4"
+VERSION = "1.1.0"
+_MAX_WORKERS = min(os.cpu_count() or 4, 8)
 
 # ==============================
 # i18n
@@ -507,6 +509,13 @@ class App:
         self.log_text.see(END)
         self.log_text.configure(state=DISABLED)
 
+    def _log_lines(self, lines: list[str]) -> None:
+        self.log_text.configure(state=NORMAL)
+        for line in lines:
+            self.log_text.insert(END, line + "\n")
+        self.log_text.see(END)
+        self.log_text.configure(state=DISABLED)
+
     def _set_buttons(self, state: str) -> None:
         self.convert_btn.configure(state=state)
         self.batch_btn.configure(state=state)
@@ -572,79 +581,107 @@ class App:
         self, sct: str, scsp: str, atlas: str, out_dir: str,
         failures: list[str] | None = None,
         on_file_done=None,
+        log_lines: list[str] | None = None,
     ) -> tuple[int, int]:
         """Convert one set of files. Returns (success_count, total_count).
 
         If *failures* is provided, failed file paths are appended to it.
         *on_file_done* is called (no args) after each file finishes.
+        If *log_lines* is provided, messages are appended there instead of
+        being posted to the UI directly (used for batch buffered output).
         """
         t = self.i.t
-        ok = 0
         total = sum(1 for p in [sct, scsp, atlas] if p)
+        _ok = [0]
+        _lock = threading.Lock()
 
-        if sct:
+        def _msg(msg: str) -> None:
+            if log_lines is not None:
+                with _lock:
+                    log_lines.append(msg)
+            else:
+                self.root.after(0, self._log, msg)
+
+        def _do_sct() -> None:
             if self._cancel_event.is_set():
-                return ok, total
-            self.root.after(0, self._log, f"  [SCT]   {Path(sct).name}")
+                return
+            _msg(f"  [SCT]   {Path(sct).name}")
             try:
                 out_png = (Path(out_dir) / Path(sct).with_suffix(".png").name).as_posix()
                 if convert_sct_to_png(sct, out_png):
-                    self.root.after(0, self._log, f"          → {out_png}")
-                    ok += 1
+                    _msg(f"          → {out_png}")
+                    with _lock:
+                        _ok[0] += 1
                 else:
-                    self.root.after(0, self._log, f"          {t('fail')}")
+                    _msg(f"          {t('fail')}")
                     if failures is not None:
-                        failures.append(sct)
+                        with _lock:
+                            failures.append(sct)
             except Exception as e:
-                self.root.after(0, self._log, f"          {t('fail')}: {e}")
+                _msg(f"          {t('fail')}: {e}")
                 if failures is not None:
-                    failures.append(sct)
+                    with _lock:
+                        failures.append(sct)
                 traceback.print_exc()
             if on_file_done:
                 on_file_done()
 
-        if scsp:
+        def _do_scsp() -> None:
             if self._cancel_event.is_set():
-                return ok, total
-            self.root.after(0, self._log, f"  [SCSP]  {Path(scsp).name}")
+                return
+            _msg(f"  [SCSP]  {Path(scsp).name}")
             try:
                 out_json = (Path(out_dir) / Path(scsp).with_suffix(".json").name).as_posix()
                 if convert_scsp_to_json(scsp, out_json):
-                    self.root.after(0, self._log, f"          → {out_json}")
-                    ok += 1
+                    _msg(f"          → {out_json}")
+                    with _lock:
+                        _ok[0] += 1
                 else:
-                    self.root.after(0, self._log, f"          {t('fail')}")
+                    _msg(f"          {t('fail')}")
                     if failures is not None:
-                        failures.append(scsp)
+                        with _lock:
+                            failures.append(scsp)
             except Exception as e:
-                self.root.after(0, self._log, f"          {t('fail')}: {e}")
+                _msg(f"          {t('fail')}: {e}")
                 if failures is not None:
-                    failures.append(scsp)
+                    with _lock:
+                        failures.append(scsp)
                 traceback.print_exc()
             if on_file_done:
                 on_file_done()
 
+        # SCT and SCSP run in parallel (both are CPU-heavy C extensions)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futs = []
+            if sct:
+                futs.append(pool.submit(_do_sct))
+            if scsp:
+                futs.append(pool.submit(_do_scsp))
+            for f in futs:
+                f.result()
+
+        # Atlas is lightweight — runs after SCT/SCSP
         if atlas:
             if self._cancel_event.is_set():
-                return ok, total
-            self.root.after(0, self._log, f"  [ATLAS] {Path(atlas).name}")
+                return _ok[0], total
+            _msg(f"  [ATLAS] {Path(atlas).name}")
             try:
                 out_atlas = (Path(out_dir) / Path(atlas).name).as_posix()
                 fix_atlas_sct_ref(atlas, out_atlas)
                 if self.fix_atlas_pma.get():
                     from fix_atlas import fix_atlas
                     fix_atlas(out_atlas, out_atlas)
-                self.root.after(0, self._log, f"          → {out_atlas}")
-                ok += 1
+                _msg(f"          → {out_atlas}")
+                _ok[0] += 1
             except Exception as e:
-                self.root.after(0, self._log, f"          {t('fail')}: {e}")
+                _msg(f"          {t('fail')}: {e}")
                 if failures is not None:
                     failures.append(atlas)
                 traceback.print_exc()
             if on_file_done:
                 on_file_done()
 
-        return ok, total
+        return _ok[0], total
 
     def _log_failure_summary(self, failures: list[str]) -> None:
         if not failures:
@@ -659,10 +696,13 @@ class App:
         t0 = time.perf_counter()
         file_count = sum(1 for p in [sct, scsp, atlas] if p)
         done = [0]
+        done_lock = threading.Lock()
 
         def on_file_done():
-            done[0] += 1
-            self.root.after(0, self._tb_progress, done[0], file_count)
+            with done_lock:
+                done[0] += 1
+                c = done[0]
+            self.root.after(0, self._tb_progress, c, file_count)
 
         self.root.after(0, self._tb_progress, 0, file_count)
         try:
@@ -713,11 +753,14 @@ class App:
             self.root.after(0, self._log, self.i.t("batch_scan", n=len(groups)) + "\n")
 
             all_file_count = sum(len(fm) for fm in groups.values())
-            done = [0]
+            _done = [0]
+            _done_lock = threading.Lock()
 
             def on_file_done():
-                done[0] += 1
-                self.root.after(0, self._tb_progress, done[0], all_file_count)
+                with _done_lock:
+                    _done[0] += 1
+                    c = _done[0]
+                self.root.after(0, self._tb_progress, c, all_file_count)
 
             self.root.after(0, self._tb_progress, 0, all_file_count)
 
@@ -726,10 +769,9 @@ class App:
             group_ok = 0
             all_failures: list[str] = []
 
-            for stem, file_map in groups.items():
+            def _process_group(stem: str, file_map: dict) -> tuple[int, int, list[str], list[str]]:
                 if self._cancel_event.is_set():
-                    break
-                self.root.after(0, self._log, f"━━ {stem} ━━")
+                    return 0, 0, [], []
 
                 sct_p = file_map.get("sct")
                 scsp_p = file_map.get("scsp")
@@ -744,18 +786,42 @@ class App:
 
                 Path(dest).mkdir(parents=True, exist_ok=True)
 
+                log_buf: list[str] = [f"━━ {stem} ━━"]
+                grp_failures: list[str] = []
+
                 ok, cnt = self._convert_one_group(
                     sct_p.as_posix() if sct_p else "",
                     scsp_p.as_posix() if scsp_p else "",
                     atlas_p.as_posix() if atlas_p else "",
                     dest,
-                    all_failures,
+                    grp_failures,
                     on_file_done,
+                    log_buf,
                 )
-                total_ok += ok
-                total_files += cnt
-                if ok == cnt:
-                    group_ok += 1
+                return ok, cnt, grp_failures, log_buf
+
+            with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+                future_map = {}
+                for stem, file_map in groups.items():
+                    if self._cancel_event.is_set():
+                        break
+                    future_map[pool.submit(_process_group, stem, file_map)] = stem
+
+                for fut in as_completed(future_map):
+                    if self._cancel_event.is_set():
+                        for f in future_map:
+                            f.cancel()
+                        break
+                    try:
+                        ok, cnt, grp_failures, log_buf = fut.result()
+                        self.root.after(0, self._log_lines, log_buf)
+                        total_ok += ok
+                        total_files += cnt
+                        if cnt > 0 and ok == cnt:
+                            group_ok += 1
+                        all_failures.extend(grp_failures)
+                    except Exception:
+                        traceback.print_exc()
 
             elapsed = self._fmt_elapsed(time.perf_counter() - t0)
             if self._cancel_event.is_set():
