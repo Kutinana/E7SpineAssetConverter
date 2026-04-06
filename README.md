@@ -86,8 +86,8 @@ python fix_atlas.py input.atlas output.atlas     # output to new file
 
 ## Known Limitations
 
-- V2 animations with draw order changes: the draw order data is skipped during conversion. This may cause incorrect slot layering in a small number of animations. All other animation data (bones, slots, skins, IK, FFD, flip) is fully converted.
-- Only supports protrait conversion.
+- V2 draw order timelines are parsed and merged, but the result may still be inaccurate for complex cases with many offset changes.
+- Portrait conversion are fully supported. As for models, it can basically generate a readable JSON, but might not be rendered properly.
 
 ## Special Thanks
 
