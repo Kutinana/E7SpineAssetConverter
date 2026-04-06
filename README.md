@@ -80,6 +80,10 @@ python fix_atlas.py input.atlas output.atlas     # output to new file
 | `.scsp`  | `.json`  | Parse Spine binary skeleton to Spine JSON              |
 | `.atlas` | `.atlas` | Replace `.sct` texture reference with `.png` on line 2 |
 
+## Known Limitations
+
+- V2 animations with draw order changes: the draw order data is skipped during conversion. This may cause incorrect slot layering in a small number of animations. All other animation data (bones, slots, skins, IK, FFD, flip) is fully converted.
+
 ## Special Thanks
 
 - [CeciliaBot/EpicSevenAssetRipper](https://github.com/CeciliaBot/EpicSevenAssetRipper)

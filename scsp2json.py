@@ -1352,13 +1352,36 @@ def _read_v2_curves(r: SpineBinaryReader, frame_count: int) -> List[Dict]:
         curves.append(entry)
     return curves
 
+def _peek_valid_v2_anim_header(r: SpineBinaryReader, sk: SkeletonData) -> bool:
+    """Check if the current reader position looks like a valid V2 animation header.
+
+    A valid header has: name_off(u32) + duration(f32) + timeline_count(u32) + first_type(u32).
+    We validate that all four fields have plausible values.
+    """
+    if r.pos + 16 > len(r.data):
+        return False
+    name_off = struct.unpack_from("<I", r.data, r.pos)[0]
+    dur_f32 = struct.unpack_from("<f", r.data, r.pos + 4)[0]
+    count = struct.unpack_from("<I", r.data, r.pos + 8)[0]
+    first_type = struct.unpack_from("<I", r.data, r.pos + 12)[0]
+    if name_off >= len(sk.stringPool):
+        return False
+    if not (dur_f32 == 0.0 or (0.01 < dur_f32 < 7200)):
+        return False
+    if count < 1 or count > 5000:
+        return False
+    if first_type > 8:
+        return False
+    return True
+
+
 def read_animations_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
     r.skip(4)  # 4 unknown bytes before animations block
     animations: List[AnimationData] = []
     data_end = len(r.data)
     string_pool_start = data_end  # spine_data doesn't include string pool
 
-    for _ in range(sk.v2_anim_count):
+    for ai in range(sk.v2_anim_count):
         anim = AnimationData()
         anim.name = get_pool_string(r.read_u32(), sk)
         r.skip(4)  # unknown
@@ -1524,14 +1547,22 @@ def read_animations_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
                 anim.ik[ik_name] = entries
 
             elif tl_type_v2 in (V2TimelineType.FlipX, V2TimelineType.FlipY):
-                # Skip flip timelines (not standard in Spine JSON export)
                 bone_idx = r.read_u32()
                 frame_count = r.read_u32()
                 for _ in range(frame_count):
                     r.read_f32()  # time
-                    r.read_u32()  # flip value
+                    r.read_byte()  # flip value (boolean, 1 byte)
             else:
                 raise ValueError(f"Unknown V2 timeline type: {tl_type_v2} at pos {r.pos}")
+
+        # Some V2 animations store draw order data after the timelines.
+        # Skip it by scanning forward to the next valid animation header.
+        if ai < sk.v2_anim_count - 1:
+            if not _peek_valid_v2_anim_header(r, sk):
+                while r.pos + 16 <= len(r.data):
+                    r.pos += 4
+                    if _peek_valid_v2_anim_header(r, sk):
+                        break
 
         animations.append(anim)
     sk.animations = animations

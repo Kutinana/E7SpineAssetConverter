@@ -21,7 +21,7 @@ from tkinter import (
 from sct2png import convert_sct_to_png
 from scsp2json import convert_scsp_to_json
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # ==============================
 # i18n
