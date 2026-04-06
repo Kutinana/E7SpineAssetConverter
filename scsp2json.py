@@ -20,8 +20,17 @@ from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import lz4.block
+import numpy as np
 
 ENDIAN = "<"
+
+_S_b = struct.Struct("<b")
+_S_B = struct.Struct("<B")
+_S_h = struct.Struct("<h")
+_S_H = struct.Struct("<H")
+_S_i = struct.Struct("<i")
+_S_I = struct.Struct("<I")
+_S_f = struct.Struct("<f")
 
 # ==============================
 # Enums
@@ -477,40 +486,63 @@ class SpineBinaryReader:
         self.pos = pos
 
     def read_byte(self) -> int:
-        return self._read(1)[0]
+        val = self.data[self.pos]
+        self.pos += 1
+        return val
 
     def read_bytes(self, n: int) -> bytes:
         return self._read(n)
 
     def read_sbyte(self) -> int:
-        return struct.unpack(f"{self.endian}b", self._read(1))[0]
+        val = _S_b.unpack_from(self.data, self.pos)[0]
+        self.pos += 1
+        return val
 
     def read_boolean(self) -> bool:
-        return self.read_byte() != 0
+        val = self.data[self.pos]
+        self.pos += 1
+        return val != 0
 
     def read_u8(self) -> int:
-        return struct.unpack(f"{self.endian}B", self._read(1))[0]
+        val = self.data[self.pos]
+        self.pos += 1
+        return val
 
     def read_i16(self) -> int:
-        return struct.unpack(f"{self.endian}h", self._read(2))[0]
+        val = _S_h.unpack_from(self.data, self.pos)[0]
+        self.pos += 2
+        return val
 
     def read_u16(self) -> int:
-        return struct.unpack(f"{self.endian}H", self._read(2))[0]
+        val = _S_H.unpack_from(self.data, self.pos)[0]
+        self.pos += 2
+        return val
 
     def read_i32(self) -> int:
-        return struct.unpack(f"{self.endian}i", self._read(4))[0]
+        val = _S_i.unpack_from(self.data, self.pos)[0]
+        self.pos += 4
+        return val
 
     def read_u32(self) -> int:
-        return struct.unpack(f"{self.endian}I", self._read(4))[0]
+        val = _S_I.unpack_from(self.data, self.pos)[0]
+        self.pos += 4
+        return val
 
     def read_f32(self) -> float:
-        return struct.unpack(f"{self.endian}f", self._read(4))[0]
+        val = _S_f.unpack_from(self.data, self.pos)[0]
+        self.pos += 4
+        return val
 
     def read_color(self, has_alpha: bool = True) -> Color:
-        r = self.read_byte()
-        g = self.read_byte()
-        b = self.read_byte()
-        a = self.read_byte() if has_alpha else 0xFF
+        p = self.pos
+        d = self.data
+        r, g, b = d[p], d[p + 1], d[p + 2]
+        if has_alpha:
+            a = d[p + 3]
+            self.pos = p + 4
+        else:
+            a = 0xFF
+            self.pos = p + 3
         return Color(r, g, b, a)
 
     def read_varint(self, optimize_positive: bool) -> int:
@@ -568,22 +600,46 @@ def get_pool_string(offset: int, sk: SkeletonData) -> Optional[str]:
     return string_pool[offset:end].decode('utf-8', errors='replace')
 
 def read_f32_array(r: SpineBinaryReader, n: int) -> List[float]:
-    return [r.read_f32() for _ in range(n)]
+    if n <= 0:
+        return []
+    vals = struct.unpack_from(f"<{n}f", r.data, r.pos)
+    r.pos += n * 4
+    return list(vals)
 
 def read_u8_array(r: SpineBinaryReader, n: int) -> List[int]:
-    return [r.read_u8() for _ in range(n)]
+    if n <= 0:
+        return []
+    vals = struct.unpack_from(f"<{n}B", r.data, r.pos)
+    r.pos += n
+    return list(vals)
 
 def read_i16_array(r: SpineBinaryReader, n: int) -> List[int]:
-    return [r.read_i16() for _ in range(n)]
+    if n <= 0:
+        return []
+    vals = struct.unpack_from(f"<{n}h", r.data, r.pos)
+    r.pos += n * 2
+    return list(vals)
 
 def read_u16_array(r: SpineBinaryReader, n: int) -> List[int]:
-    return [r.read_u16() for _ in range(n)]
+    if n <= 0:
+        return []
+    vals = struct.unpack_from(f"<{n}H", r.data, r.pos)
+    r.pos += n * 2
+    return list(vals)
 
 def read_i32_array(r: SpineBinaryReader, n: int) -> List[int]:
-    return [r.read_i32() for _ in range(n)]
+    if n <= 0:
+        return []
+    vals = struct.unpack_from(f"<{n}i", r.data, r.pos)
+    r.pos += n * 4
+    return list(vals)
 
 def read_u32_array(r: SpineBinaryReader, n: int) -> List[int]:
-    return [r.read_u32() for _ in range(n)]
+    if n <= 0:
+        return []
+    vals = struct.unpack_from(f"<{n}I", r.data, r.pos)
+    r.pos += n * 4
+    return list(vals)
 
 def can_merge_weighted_vertices(vertices: List[float], bones: List[int]) -> bool:
     bpos = 0
@@ -1056,14 +1112,12 @@ def read_animations_v3(r: SpineBinaryReader, sk: SkeletonData) -> None:
                     setup_verts = att.vertices
                 offsets: List[List[float]] = []
                 if not is_weighted and setup_verts:
+                    sv = np.array(setup_verts)
                     for dv in deform_verts:
-                        fo: List[float] = []
-                        cnt = min(len(dv), len(setup_verts))
-                        for i in range(cnt):
-                            fo.append(dv[i] - setup_verts[i])
-                        if len(dv) < len(setup_verts):
-                            fo.extend([0.0] * (len(setup_verts) - len(dv)))
-                        offsets.append(fo)
+                        dv_arr = np.zeros(len(sv))
+                        cnt = min(len(dv), len(sv))
+                        dv_arr[:cnt] = dv[:cnt]
+                        offsets.append((dv_arr - sv).tolist())
                 else:
                     offsets = deform_verts
                 t = DeformTimeline()
@@ -1623,19 +1677,20 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
                 break
 
         entries = []
+        sv_arr = np.array(setup_verts) if setup_verts else None
         for fi in range(frame_count):
             entry: Dict[str, Any] = {}
             if fi < len(curves) and curves[fi]:
                 entry.update(curves[fi])
             entry["time"] = round(times[fi], 4)
             fv = all_verts[fi]
-            if setup_verts and len(fv) == len(setup_verts):
-                offsets = [fv[i] - setup_verts[i] for i in range(len(fv))]
+            if sv_arr is not None and len(fv) == len(sv_arr):
+                off_arr = np.array(fv) - sv_arr
+                if np.any(off_arr != 0):
+                    entry["vertices"] = np.round(off_arr, 8).tolist()
             else:
-                offsets = fv
-            all_zero = all(v == 0 for v in offsets)
-            if not all_zero:
-                entry["vertices"] = [round(v, 8) for v in offsets]
+                if any(v != 0 for v in fv):
+                    entry["vertices"] = [round(v, 8) for v in fv]
             entries.append(entry)
         anim.ffd.setdefault(ffd_skin, {}).setdefault(ffd_slot, {})[ffd_att] = entries
 
@@ -2407,21 +2462,6 @@ def write_json_data(sk: SkeletonData) -> Dict[str, Any]:
 
 
 # ==============================
-# V3 special post-processing
-# ==============================
-def special_process_v3(json_str: str) -> str:
-    """No-op post-processor kept for interface compatibility.
-
-    The original implementation incorrectly deleted expression-slot entries
-    (e.g. normal5 / mouth) from the "normal" skin when all expression skins
-    shared that slot.  The default skin already contains all base parts
-    (body + head structure) and must not be modified; expression skins
-    (normal, angry, …) overlay on top of it.  No post-processing is needed.
-    """
-    return json_str
-
-
-# ==============================
 # Converter
 # ==============================
 def convert_scsp_to_json(input_path: str, output_path: str, compress: bool = True) -> bool:
@@ -2441,13 +2481,8 @@ def convert_scsp_to_json(input_path: str, output_path: str, compress: bool = Tru
         return False
 
     root = write_json_data(skeleton)
-    json_str = json.dumps(root, ensure_ascii=False)
-
-    if skeleton.scspVersion == ScspVersion.V3:
-        json_str = special_process_v3(json_str)
-
-    if compress:
-        json_str = json.dumps(json.loads(json_str), separators=(",", ":"))
+    sep = (",", ":") if compress else (", ", ": ")
+    json_str = json.dumps(root, ensure_ascii=False, separators=sep)
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(json_str)
