@@ -21,6 +21,8 @@ from tkinter import (
 from sct2png import convert_sct_to_png
 from scsp2json import convert_scsp_to_json
 
+VERSION = "1.0.1"
+
 # ==============================
 # i18n
 # ==============================
@@ -57,6 +59,7 @@ STRINGS: dict[str, dict[str, str]] = {
     "batch_done":         {"zh": "批量转换完成: {gok}/{gtotal} 组全部成功, 共 {fok}/{ftotal} 个文件。",
                            "en": "Batch done: {gok}/{gtotal} group(s) fully succeeded, {fok}/{ftotal} file(s) total."},
     "fail":               {"zh": "失败",                           "en": "FAIL"},
+    "fail_summary_header": {"zh": "━━ 失败文件列表 ({n} 个) ━━",   "en": "━━ Failed files ({n}) ━━"},
     "ft_sct":             {"zh": "SCT 纹理",                       "en": "SCT Texture"},
     "ft_scsp":            {"zh": "SCSP Spine 二进制",              "en": "SCSP Spine Binary"},
     "ft_atlas":           {"zh": "Atlas 文件",                     "en": "Atlas File"},
@@ -150,7 +153,7 @@ class App:
     def __init__(self) -> None:
         self.i = I18n()
         self.root = Tk()
-        self.root.title(self.i.t("title"))
+        self.root.title(f"{self.i.t('title')} v{VERSION}")
         self.root.resizable(False, False)
 
         self.sct_path = StringVar()
@@ -181,7 +184,7 @@ class App:
 
     def _refresh_texts(self) -> None:
         t = self.i.t
-        self.root.title(t("title"))
+        self.root.title(f"{t('title')} v{VERSION}")
         ww = self._widgets
         ww["notebook"].tab(0, text=t("tab_single"))
         ww["notebook"].tab(1, text=t("tab_batch"))
@@ -389,8 +392,14 @@ class App:
         self._set_buttons(DISABLED)
         threading.Thread(target=self._do_convert, args=(sct, scsp, atlas, out), daemon=True).start()
 
-    def _convert_one_group(self, sct: str, scsp: str, atlas: str, out_dir: str) -> tuple[int, int]:
-        """Convert one set of files. Returns (success_count, total_count)."""
+    def _convert_one_group(
+        self, sct: str, scsp: str, atlas: str, out_dir: str,
+        failures: list[str] | None = None,
+    ) -> tuple[int, int]:
+        """Convert one set of files. Returns (success_count, total_count).
+
+        If *failures* is provided, failed file paths are appended to it.
+        """
         t = self.i.t
         ok = 0
         total = sum(1 for p in [sct, scsp, atlas] if p)
@@ -399,22 +408,34 @@ class App:
             self.root.after(0, self._log, f"  [SCT]   {Path(sct).name}")
             try:
                 out_png = str(Path(out_dir) / Path(sct).with_suffix(".png").name)
-                convert_sct_to_png(sct, out_png)
-                self.root.after(0, self._log, f"          → {out_png}")
-                ok += 1
+                if convert_sct_to_png(sct, out_png):
+                    self.root.after(0, self._log, f"          → {out_png}")
+                    ok += 1
+                else:
+                    self.root.after(0, self._log, f"          {t('fail')}")
+                    if failures is not None:
+                        failures.append(sct)
             except Exception as e:
                 self.root.after(0, self._log, f"          {t('fail')}: {e}")
+                if failures is not None:
+                    failures.append(sct)
                 traceback.print_exc()
 
         if scsp:
             self.root.after(0, self._log, f"  [SCSP]  {Path(scsp).name}")
             try:
                 out_json = str(Path(out_dir) / Path(scsp).with_suffix(".json").name)
-                convert_scsp_to_json(scsp, out_json)
-                self.root.after(0, self._log, f"          → {out_json}")
-                ok += 1
+                if convert_scsp_to_json(scsp, out_json):
+                    self.root.after(0, self._log, f"          → {out_json}")
+                    ok += 1
+                else:
+                    self.root.after(0, self._log, f"          {t('fail')}")
+                    if failures is not None:
+                        failures.append(scsp)
             except Exception as e:
                 self.root.after(0, self._log, f"          {t('fail')}: {e}")
+                if failures is not None:
+                    failures.append(scsp)
                 traceback.print_exc()
 
         if atlas:
@@ -429,15 +450,28 @@ class App:
                 ok += 1
             except Exception as e:
                 self.root.after(0, self._log, f"          {t('fail')}: {e}")
+                if failures is not None:
+                    failures.append(atlas)
                 traceback.print_exc()
 
         return ok, total
 
+    def _log_failure_summary(self, failures: list[str]) -> None:
+        if not failures:
+            return
+        t = self.i.t
+        self.root.after(0, self._log, t("fail_summary_header", n=len(failures)))
+        for f in failures:
+            self.root.after(0, self._log, f"  • {f}")
+        self.root.after(0, self._log, "")
+
     def _do_convert(self, sct: str, scsp: str, atlas: str, out_dir: str) -> None:
         try:
             Path(out_dir).mkdir(parents=True, exist_ok=True)
-            ok, total = self._convert_one_group(sct, scsp, atlas, out_dir)
+            failures: list[str] = []
+            ok, total = self._convert_one_group(sct, scsp, atlas, out_dir, failures)
             self.root.after(0, self._log, "\n" + self.i.t("done_single", ok=ok, total=total) + "\n")
+            self._log_failure_summary(failures)
         finally:
             self.root.after(0, self._set_buttons, NORMAL)
 
@@ -473,6 +507,7 @@ class App:
             total_ok = 0
             total_files = 0
             group_ok = 0
+            all_failures: list[str] = []
 
             for stem, file_map in groups.items():
                 self.root.after(0, self._log, f"━━ {stem} ━━")
@@ -495,6 +530,7 @@ class App:
                     str(scsp_p) if scsp_p else "",
                     str(atlas_p) if atlas_p else "",
                     dest,
+                    all_failures,
                 )
                 total_ok += ok
                 total_files += cnt
@@ -506,6 +542,7 @@ class App:
                 "\n" + self.i.t("batch_done", gok=group_ok, gtotal=len(groups),
                                 fok=total_ok, ftotal=total_files) + "\n",
             )
+            self._log_failure_summary(all_failures)
         finally:
             self.root.after(0, self._set_buttons, NORMAL)
 

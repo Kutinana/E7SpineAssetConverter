@@ -82,9 +82,9 @@ python fix_atlas.py input.atlas output.atlas     # output to new file
 
 ## Special Thanks
 
-* [CeciliaBot/EpicSevenAssetRipper](https://github.com/CeciliaBot/EpicSevenAssetRipper)
-* [ww-rm/SpineViewer](https://github.com/ww-rm/SpineViewer)
-* [violet-wdream/.Scripts](https://github.com/violet-wdream/.Scripts)
-* [juno181/spine-runtimes-2.1.27](https://github.com/juno181/spine-runtimes-2.1.27)
-* e7vault/epic7_scsp2json
-* Twistzz
+- [CeciliaBot/EpicSevenAssetRipper](https://github.com/CeciliaBot/EpicSevenAssetRipper)
+- [ww-rm/SpineViewer](https://github.com/ww-rm/SpineViewer)
+- [violet-wdream/.Scripts](https://github.com/violet-wdream/.Scripts)
+- [juno181/spine-runtimes-2.1.27](https://github.com/juno181/spine-runtimes-2.1.27)
+- e7vault/epic7_scsp2json
+- Twistzz

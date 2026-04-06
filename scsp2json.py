@@ -622,15 +622,24 @@ def custom_data_preprocess(reader: SpineBinaryReader, skeleton: SkeletonData) ->
     data_size = reader.read_u32()
     string_pool_size = reader.read_u32()
     data_start_pos = reader.pos
+
     magic = reader.read_bytes(4)
-    version = reader.read_u32()
-    if magic != b"scsp":
-        raise ValueError(f"Invalid magic: {magic}")
-    reader.reset_pos(data_start_pos)
-    spine_data = reader.read_bytes(data_size)
-    string_pool = reader.read_bytes(string_pool_size)
-    reader.reset_data(spine_data)
-    skeleton.scspVersion = ScspVersion.V3 if version > 2 else ScspVersion.V2
+
+    if magic == b"scsp":
+        version = reader.read_u32()
+        reader.reset_pos(data_start_pos)
+        spine_data = reader.read_bytes(data_size)
+        string_pool = reader.read_bytes(string_pool_size)
+        reader.reset_data(spine_data)
+        skeleton.scspVersion = ScspVersion.V3 if version > 2 else ScspVersion.V2
+    else:
+        # V2: no magic header — data section starts directly with spine data
+        reader.reset_pos(data_start_pos)
+        spine_data = reader.read_bytes(data_size)
+        string_pool = reader.read_bytes(string_pool_size)
+        reader.reset_data(spine_data)
+        skeleton.scspVersion = ScspVersion.V2
+
     skeleton.stringPool = string_pool
 
 
@@ -1100,26 +1109,61 @@ def read_scsp_v3(r: SpineBinaryReader, sk: SkeletonData) -> None:
 # V2 Reading Functions (2.1.27)
 # ==============================
 def read_skeleton_info_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
-    r.reset_pos(8)
-    _unknown = r.read_u32()  # typically 88
-    sk.width = r.read_f32()
-    sk.height = r.read_f32()
-    _extra_floats = read_f32_array(r, 4)  # bounding box related
+    """Two V2 sub-layouts exist:
 
-    sk.v2_bone_count = r.read_u32()
-    sk.v2_ik_count = r.read_u32()
-    sk.v2_slot_count = r.read_u32()
-    sk.v2_skin_count = r.read_u32()
-    sk.v2_event_count = r.read_u32()
-    sk.v2_anim_count = r.read_u32()
+    WITH magic ("scsp" at spine_data[0:4], version u32 at [4:8]):
+      [8]   _unknown (88)
+      [12]  width        f32
+      [16]  height       f32
+      [20]  extra_floats (4 × f32, 16 bytes)
+      [36]  bone_count … anim_count (6 × u32, 24 bytes)
+      [60]  (40 bytes reserved)
+      [100] hash_off     u32
+      [104] ver_off      u32
+      [108] bone data begins
 
-    r.skip(40)  # unknown reserved bytes
+    WITHOUT magic (data starts directly):
+      [0]   bone_count … anim_count (6 × u32, 24 bytes)
+      [24]  (40 bytes reserved)
+      [64]  width        f32
+      [68]  height       f32
+      [72]  hash_off     u32
+      [76]  ver_off      u32
+      [80]  bone data begins
+    """
+    has_magic = r.data[:4] == b"scsp"
 
-    hash_off = r.read_u32()
-    ver_off = r.read_u32()
+    if has_magic:
+        r.reset_pos(8)
+        _unknown = r.read_u32()
+        sk.width = r.read_f32()
+        sk.height = r.read_f32()
+        r.skip(16)  # 4 extra floats
+        sk.v2_bone_count = r.read_u32()
+        sk.v2_ik_count = r.read_u32()
+        sk.v2_slot_count = r.read_u32()
+        sk.v2_skin_count = r.read_u32()
+        sk.v2_event_count = r.read_u32()
+        sk.v2_anim_count = r.read_u32()
+        r.skip(40)
+        hash_off = r.read_u32()
+        ver_off = r.read_u32()
+    else:
+        r.reset_pos(0)
+        sk.v2_bone_count = r.read_u32()
+        sk.v2_ik_count = r.read_u32()
+        sk.v2_slot_count = r.read_u32()
+        sk.v2_skin_count = r.read_u32()
+        sk.v2_event_count = r.read_u32()
+        sk.v2_anim_count = r.read_u32()
+        r.skip(40)
+        sk.width = r.read_f32()
+        sk.height = r.read_f32()
+        hash_off = r.read_u32()
+        ver_off = r.read_u32()
+
     sk.hashString = get_pool_string(hash_off, sk)
     ver_str = get_pool_string(ver_off, sk)
-    # "2.1.27.scsp" → "2.1.27"
     if ver_str and ".scsp" in ver_str:
         sk.version = ver_str.replace(".scsp", "")
     else:
@@ -1163,6 +1207,25 @@ def read_slots_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
         slot.blendMode = BlendMode(blend) if blend <= 3 else BlendMode.Normal
         slots.append(slot)
     sk.slots = slots
+
+def read_iks_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
+    iks: List[IKConstraintData] = []
+    for _ in range(sk.v2_ik_count):
+        ik = IKConstraintData()
+        name_off = r.read_u32()
+        bone_count = r.read_u16()
+        bone_idxs = read_u16_array(r, bone_count)
+        target_idx = r.read_u16()
+        ik.mix = r.read_f32()
+        bend = r.read_i32()
+        ik.name = get_pool_string(name_off, sk)
+        ik.bendPositive = bend > 0
+        ik.target = sk.bones[target_idx].name if 0 <= target_idx < len(sk.bones) else None
+        for bi in bone_idxs:
+            if 0 <= bi < len(sk.bones):
+                ik.bones.append(sk.bones[bi].name)
+        iks.append(ik)
+    sk.ikConstraints = iks
 
 def read_skins_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
     skins: List[SkinData] = []
@@ -1475,6 +1538,7 @@ def read_animations_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
 
 def read_scsp_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
     read_bones_v2(r, sk)
+    read_iks_v2(r, sk)
     read_slots_v2(r, sk)
     read_skins_v2(r, sk)
     read_animations_v2(r, sk)
