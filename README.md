@@ -43,7 +43,7 @@ pyinstaller --onefile --windowed --name "E7SpineConverter" --hidden-import=textu
 
 The executable will be in `dist/E7SpineConverter.exe`.
 
-You can find pre-built executable in [Releases](./releases).
+You can find pre-built executable in [Releases](https://github.com/Kutinana/E7SpineAssetConverter/releases).
 
 ### Command Line
 
