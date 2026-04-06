@@ -2,6 +2,10 @@
 
 Convert Epic Seven Spine assets (`.sct`, `.scsp`, `.atlas`) into standard formats (`.png`, `.json`, `.atlas`).
 
+<div align="center">
+<img width="557" height="586" alt="screenshot" src="https://github.com/user-attachments/assets/29d38e0d-3436-4e9f-b9f6-d5beead75c54" />
+</div>
+
 ## Supported Versions
 
 | SCSP Version | Spine Version | Internal ID |
