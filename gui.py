@@ -58,6 +58,8 @@ STRINGS: dict[str, dict[str, str]] = {
                            "en": "No .sct / .scsp / .atlas files found in the folder."},
     "batch_done":         {"zh": "批量转换完成: {gok}/{gtotal} 组全部成功, 共 {fok}/{ftotal} 个文件。",
                            "en": "Batch done: {gok}/{gtotal} group(s) fully succeeded, {fok}/{ftotal} file(s) total."},
+    "stop":               {"zh": "停止",                           "en": "Stop"},
+    "cancelled":          {"zh": "转换已被用户取消。",               "en": "Conversion cancelled by user."},
     "fail":               {"zh": "失败",                           "en": "FAIL"},
     "fail_summary_header": {"zh": "━━ 失败文件列表 ({n} 个) ━━",   "en": "━━ Failed files ({n}) ━━"},
     "ft_sct":             {"zh": "SCT 纹理",                       "en": "SCT Texture"},
@@ -167,6 +169,7 @@ class App:
         self.batch_recursive = BooleanVar(value=False)
 
         self._widgets: dict[str, object] = {}
+        self._cancel_event = threading.Event()
 
         self._build_ui()
         self._center_window()
@@ -197,6 +200,8 @@ class App:
         for b in ww["browse_btns"]:
             b.configure(text=t("browse"))
         ww["convert_btn"].configure(text=t("convert"))
+        ww["stop_btn"].configure(text=t("stop"))
+        ww["batch_stop_btn"].configure(text=t("stop"))
         ww["batch_in_frame"].configure(text=t("input_folder"))
         ww["batch_in_lbl"].configure(text=t("folder"))
         ww["batch_out_frame"].configure(text=t("output_folder"))
@@ -263,9 +268,14 @@ class App:
         b = ttk.Button(out_frame, text=t("browse"), width=8, command=self._browse_out_dir)
         b.grid(row=0, column=2, padx=(4, 0)); browse_btns.append(b)
 
-        self.convert_btn = ttk.Button(tab_single, text=t("convert"), width=16, command=self._on_convert)
-        self.convert_btn.pack(pady=8)
+        btn_frame_single = ttk.Frame(tab_single)
+        btn_frame_single.pack(pady=8)
+        self.convert_btn = ttk.Button(btn_frame_single, text=t("convert"), width=16, command=self._on_convert)
+        self.convert_btn.pack(side="left", padx=(0, 4))
         ww["convert_btn"] = self.convert_btn
+        self.stop_btn = ttk.Button(btn_frame_single, text=t("stop"), width=8, command=self._on_stop, state=DISABLED)
+        self.stop_btn.pack(side="left")
+        ww["stop_btn"] = self.stop_btn
 
         # ==================== Tab 2: batch ====================
         tab_batch = ttk.Frame(notebook, padding=8)
@@ -300,9 +310,14 @@ class App:
         ww["batch_recursive_cb"] = ttk.Checkbutton(batch_opt, text=t("recursive"), variable=self.batch_recursive)
         ww["batch_recursive_cb"].pack(anchor="w")
 
-        self.batch_btn = ttk.Button(tab_batch, text=t("batch_convert"), width=16, command=self._on_batch)
-        self.batch_btn.pack(pady=8)
+        btn_frame_batch = ttk.Frame(tab_batch)
+        btn_frame_batch.pack(pady=8)
+        self.batch_btn = ttk.Button(btn_frame_batch, text=t("batch_convert"), width=16, command=self._on_batch)
+        self.batch_btn.pack(side="left", padx=(0, 4))
         ww["batch_btn"] = self.batch_btn
+        self.batch_stop_btn = ttk.Button(btn_frame_batch, text=t("stop"), width=8, command=self._on_stop, state=DISABLED)
+        self.batch_stop_btn.pack(side="left")
+        ww["batch_stop_btn"] = self.batch_stop_btn
 
         # ==================== Shared: options + language + log ====================
         bottom = ttk.Frame(root)
@@ -373,6 +388,12 @@ class App:
     def _set_buttons(self, state: str) -> None:
         self.convert_btn.configure(state=state)
         self.batch_btn.configure(state=state)
+        stop_state = DISABLED if state == NORMAL else NORMAL
+        self.stop_btn.configure(state=stop_state)
+        self.batch_stop_btn.configure(state=stop_state)
+
+    def _on_stop(self) -> None:
+        self._cancel_event.set()
 
     # ---- single convert ----
     def _on_convert(self) -> None:
@@ -389,6 +410,7 @@ class App:
             messagebox.showwarning(t("warn"), t("warn_no_output"))
             return
 
+        self._cancel_event.clear()
         self._set_buttons(DISABLED)
         threading.Thread(target=self._do_convert, args=(sct, scsp, atlas, out), daemon=True).start()
 
@@ -405,6 +427,8 @@ class App:
         total = sum(1 for p in [sct, scsp, atlas] if p)
 
         if sct:
+            if self._cancel_event.is_set():
+                return ok, total
             self.root.after(0, self._log, f"  [SCT]   {Path(sct).name}")
             try:
                 out_png = str(Path(out_dir) / Path(sct).with_suffix(".png").name)
@@ -422,6 +446,8 @@ class App:
                 traceback.print_exc()
 
         if scsp:
+            if self._cancel_event.is_set():
+                return ok, total
             self.root.after(0, self._log, f"  [SCSP]  {Path(scsp).name}")
             try:
                 out_json = str(Path(out_dir) / Path(scsp).with_suffix(".json").name)
@@ -439,6 +465,8 @@ class App:
                 traceback.print_exc()
 
         if atlas:
+            if self._cancel_event.is_set():
+                return ok, total
             self.root.after(0, self._log, f"  [ATLAS] {Path(atlas).name}")
             try:
                 out_atlas = str(Path(out_dir) / Path(atlas).name)
@@ -470,8 +498,11 @@ class App:
             Path(out_dir).mkdir(parents=True, exist_ok=True)
             failures: list[str] = []
             ok, total = self._convert_one_group(sct, scsp, atlas, out_dir, failures)
-            self.root.after(0, self._log, "\n" + self.i.t("done_single", ok=ok, total=total) + "\n")
-            self._log_failure_summary(failures)
+            if self._cancel_event.is_set():
+                self.root.after(0, self._log, "\n" + self.i.t("cancelled") + "\n")
+            else:
+                self.root.after(0, self._log, "\n" + self.i.t("done_single", ok=ok, total=total) + "\n")
+                self._log_failure_summary(failures)
         finally:
             self.root.after(0, self._set_buttons, NORMAL)
 
@@ -491,6 +522,7 @@ class App:
             out_dir = in_dir
             self.batch_out_dir.set(out_dir)
 
+        self._cancel_event.clear()
         self._set_buttons(DISABLED)
         recursive = self.batch_recursive.get()
         threading.Thread(target=self._do_batch, args=(in_dir, out_dir, recursive), daemon=True).start()
@@ -510,6 +542,8 @@ class App:
             all_failures: list[str] = []
 
             for stem, file_map in groups.items():
+                if self._cancel_event.is_set():
+                    break
                 self.root.after(0, self._log, f"━━ {stem} ━━")
 
                 sct_p = file_map.get("sct")
@@ -537,12 +571,15 @@ class App:
                 if ok == cnt:
                     group_ok += 1
 
-            self.root.after(
-                0, self._log,
-                "\n" + self.i.t("batch_done", gok=group_ok, gtotal=len(groups),
-                                fok=total_ok, ftotal=total_files) + "\n",
-            )
-            self._log_failure_summary(all_failures)
+            if self._cancel_event.is_set():
+                self.root.after(0, self._log, "\n" + self.i.t("cancelled") + "\n")
+            else:
+                self.root.after(
+                    0, self._log,
+                    "\n" + self.i.t("batch_done", gok=group_ok, gtotal=len(groups),
+                                    fok=total_ok, ftotal=total_files) + "\n",
+                )
+                self._log_failure_summary(all_failures)
         finally:
             self.root.after(0, self._set_buttons, NORMAL)
 
