@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import math
 import os
 import struct
 import sys
@@ -86,6 +88,8 @@ class V2TimelineType(IntEnum):
     FlipY = 6
     FFD = 7
     IkConstraint = 8
+    DrawOrder = 9
+    Event = 10
 
 class TimelineType(IntEnum):
     Rotate = 0
@@ -413,6 +417,7 @@ class AnimationData:
     ffd: Dict[str, Dict[str, Dict[str, List[Any]]]] = field(default_factory=dict)
     drawOrder: List[Any] = field(default_factory=list)
     events: List[Any] = field(default_factory=list)
+    _v2_draworder_raw: List[Any] = field(default_factory=list)
 
 @dataclass
 class SkeletonData:
@@ -1242,19 +1247,34 @@ def read_skins_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
             att_name_off = r.read_u32()
             slot_idx = r.read_u32()
             data_type = r.read_u32()
-            item_name_off = r.read_u32()
-            item_path_off = r.read_u32()
 
             att_name = get_pool_string(att_name_off, sk)
             slot_name = sk.slots[slot_idx].name if 0 <= slot_idx < len(sk.slots) else None
-            item_name = get_pool_string(item_name_off, sk)
-            item_path = get_pool_string(item_path_off, sk)
 
             skin_records.append({
                 'skin': skin.name,
                 'skin_slot': slot_name,
                 'skin_attachment': att_name
             })
+
+            if data_type == V2AttachmentType.BoundingBox:
+                # BoundingBox has a different header: item_name(u32) + vertex_count(u32),
+                # with NO item_path field (unlike Region/Mesh/SkinnedMesh).
+                item_name_off = r.read_u32()
+                vert_count = r.read_u32()
+                verts = read_f32_array(r, vert_count)
+                att = BoundingBoxAttachment()
+                att.vertices = verts
+                att.vertexCount = vert_count // 2
+                att.name = get_pool_string(item_name_off, sk)
+                att.type = AttachmentType.Boundingbox
+                attachments[slot_name][att_name] = att
+                continue
+
+            item_name_off = r.read_u32()
+            item_path_off = r.read_u32()
+            item_name = get_pool_string(item_name_off, sk)
+            item_path = get_pool_string(item_path_off, sk)
 
             if data_type == V2AttachmentType.Region:
                 att = RegionAttachment()
@@ -1352,218 +1372,487 @@ def _read_v2_curves(r: SpineBinaryReader, frame_count: int) -> List[Dict]:
         curves.append(entry)
     return curves
 
+def _try_parse_v2_anim_entry(r: SpineBinaryReader, sk: SkeletonData) -> bool:
+    """Try to parse the first timeline entry of a candidate animation header.
+
+    Reads from pos+12 (skipping header) and attempts to fully parse one
+    timeline entry. Returns True only if the entry parsed without error
+    AND the next u32 is also a valid timeline type.
+    """
+    saved = r.pos
+    try:
+        r.reset_pos(saved + 12)
+        tl_type = r.read_u32()
+        if tl_type in (0, 2):  # Scale / Translate
+            bone_idx = r.read_u32()
+            raw = r.read_u32()
+            fc = raw // 3
+            if fc < 1 or fc > 2000 or raw % 3 != 0:
+                return False
+            r.skip(fc * 12)
+            _read_v2_curves(r, fc)
+        elif tl_type == 1:  # Rotate
+            bone_idx = r.read_u32()
+            raw = r.read_u32()
+            fc = raw // 2
+            if fc < 1 or fc > 2000 or raw % 2 != 0:
+                return False
+            r.skip(fc * 8)
+            _read_v2_curves(r, fc)
+        elif tl_type == 3:  # Color
+            slot_idx = r.read_u32()
+            raw = r.read_u32()
+            fc = raw // 5
+            if fc < 1 or fc > 2000 or raw % 5 != 0:
+                return False
+            r.skip(fc * 20)
+            _read_v2_curves(r, fc)
+        elif tl_type == 4:  # Attachment
+            r.skip(4)
+            fc = r.read_u32()
+            if fc < 1 or fc > 2000:
+                return False
+            r.skip(fc * 8)
+        elif tl_type in (5, 6):  # FlipX / FlipY
+            r.skip(4)
+            fc = r.read_u32()
+            if fc < 1 or fc > 2000:
+                return False
+            for _ in range(fc):
+                r.read_f32()
+                r.read_byte()
+        else:
+            r.reset_pos(saved)
+            return tl_type <= 10
+        # Check the next u32 is also a valid timeline type
+        if r.pos + 4 <= len(r.data):
+            next_type = struct.unpack_from("<I", r.data, r.pos)[0]
+            if next_type > 10:
+                r.reset_pos(saved)
+                return False
+        r.reset_pos(saved)
+        return True
+    except Exception:
+        r.reset_pos(saved)
+        return False
+
+
 def _peek_valid_v2_anim_header(r: SpineBinaryReader, sk: SkeletonData) -> bool:
     """Check if the current reader position looks like a valid V2 animation header.
 
-    A valid header has: name_off(u32) + duration(f32) + timeline_count(u32) + first_type(u32).
-    We validate that all four fields have plausible values.
+    A valid header has: name_off(u32) + unknown(u32) + timeline_count(u32) + first_type(u32).
+    We validate all four fields plus the first timeline entry's index field.
     """
-    if r.pos + 16 > len(r.data):
+    if r.pos + 20 > len(r.data):
         return False
     name_off = struct.unpack_from("<I", r.data, r.pos)[0]
+    dur_u32 = struct.unpack_from("<I", r.data, r.pos + 4)[0]
     dur_f32 = struct.unpack_from("<f", r.data, r.pos + 4)[0]
     count = struct.unpack_from("<I", r.data, r.pos + 8)[0]
     first_type = struct.unpack_from("<I", r.data, r.pos + 12)[0]
+    first_idx = struct.unpack_from("<I", r.data, r.pos + 16)[0]
+
     if name_off >= len(sk.stringPool):
         return False
-    if not (dur_f32 == 0.0 or (0.01 < dur_f32 < 7200)):
+    name = get_pool_string(name_off, sk)
+    if not name or len(name) > 40 or not all(32 <= ord(c) < 127 for c in name):
         return False
+
+    if not (dur_f32 == 0.0 or (0.001 < abs(dur_f32) < 600)):
+        return False
+    if dur_u32 != 0 and dur_f32 == 0.0:
+        return False
+
     if count < 1 or count > 5000:
         return False
-    if first_type > 8:
+    if first_type > 10:
         return False
+
+    # Validate first timeline entry's index against known bounds
+    bone_count = len(sk.bones) if sk.bones else sk.v2_bone_count
+    slot_count = len(sk.slots) if sk.slots else sk.v2_slot_count
+    ik_count = len(sk.ikConstraints) if sk.ikConstraints else 0
+
+    if first_type in (0, 1, 2, 5, 6):  # Scale/Rotate/Translate/FlipX/FlipY → bone_idx
+        if first_idx >= bone_count:
+            return False
+    elif first_type in (3, 4):  # Color/Attachment → slot_idx
+        if first_idx >= slot_count:
+            return False
+    elif first_type == 8:  # IkConstraint → ik_idx
+        if ik_count > 0 and first_idx >= ik_count:
+            return False
+    elif first_type == 7:  # FFD → frame_count
+        if first_idx < 1 or first_idx > 2000:
+            return False
+
     return True
 
 
-def read_animations_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
-    r.skip(4)  # 4 unknown bytes before animations block
-    animations: List[AnimationData] = []
-    data_end = len(r.data)
-    string_pool_start = data_end  # spine_data doesn't include string pool
+def read_events_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
+    r.skip(4)  # default skin index
+    events: List[EventData] = []
+    for _ in range(sk.v2_event_count):
+        ev = EventData()
+        name_off = r.read_u32()
+        ev.intValue = r.read_i32()
+        ev.floatValue = r.read_f32()
+        str_off = r.read_u32()
+        ev.name = get_pool_string(name_off, sk)
+        ev.stringValue = get_pool_string(str_off, sk)
+        events.append(ev)
+    sk.events = events
 
-    for ai in range(sk.v2_anim_count):
+
+def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
+                             anim: 'AnimationData', tl_type_v2: int) -> bool:
+    """Parse a single V2 timeline entry. Returns True if parsed, False to break."""
+    if tl_type_v2 == V2TimelineType.Scale:
+        bone_idx = r.read_u32()
+        raw_count = r.read_u32()
+        frame_count = raw_count // 3
+        entries = []
+        for fi in range(frame_count):
+            t, x, y = r.read_f32(), r.read_f32(), r.read_f32()
+            entry: Dict[str, Any] = {"time": round(t, 4)}
+            entry["x"] = round(x, 4)
+            entry["y"] = round(y, 4)
+            entries.append(entry)
+            anim.duration = max(anim.duration, t)
+        curves = _read_v2_curves(r, frame_count)
+        for ci, cv in enumerate(curves):
+            if cv:
+                entries[ci].update(cv)
+        bone_name = sk.bones[bone_idx].name if 0 <= bone_idx < len(sk.bones) else ""
+        anim.bones.setdefault(bone_name, {})["scale"] = entries
+
+    elif tl_type_v2 == V2TimelineType.Rotate:
+        bone_idx = r.read_u32()
+        raw_count = r.read_u32()
+        frame_count = raw_count // 2
+        entries = []
+        for fi in range(frame_count):
+            t, angle = r.read_f32(), r.read_f32()
+            entry: Dict[str, Any] = {"time": round(t, 4), "angle": round(angle, 4)}
+            entries.append(entry)
+            anim.duration = max(anim.duration, t)
+        curves = _read_v2_curves(r, frame_count)
+        for ci, cv in enumerate(curves):
+            if cv:
+                entries[ci].update(cv)
+        bone_name = sk.bones[bone_idx].name if 0 <= bone_idx < len(sk.bones) else ""
+        anim.bones.setdefault(bone_name, {})["rotate"] = entries
+
+    elif tl_type_v2 == V2TimelineType.Translate:
+        bone_idx = r.read_u32()
+        raw_count = r.read_u32()
+        frame_count = raw_count // 3
+        entries = []
+        for fi in range(frame_count):
+            t, x, y = r.read_f32(), r.read_f32(), r.read_f32()
+            entry: Dict[str, Any] = {"time": round(t, 4)}
+            if round(x, 4) != 0: entry["x"] = round(x, 4)
+            if round(y, 4) != 0: entry["y"] = round(y, 4)
+            entries.append(entry)
+            anim.duration = max(anim.duration, t)
+        curves = _read_v2_curves(r, frame_count)
+        for ci, cv in enumerate(curves):
+            if cv:
+                entries[ci].update(cv)
+        bone_name = sk.bones[bone_idx].name if 0 <= bone_idx < len(sk.bones) else ""
+        anim.bones.setdefault(bone_name, {})["translate"] = entries
+
+    elif tl_type_v2 == V2TimelineType.Color:
+        slot_idx = r.read_u32()
+        raw_count = r.read_u32()
+        frame_count = raw_count // 5
+        entries = []
+        for fi in range(frame_count):
+            t = r.read_f32()
+            cr, cg, cb, ca = r.read_f32(), r.read_f32(), r.read_f32(), r.read_f32()
+            color = f32_color(cr, cg, cb, ca)
+            entry: Dict[str, Any] = {"time": round(t, 4)}
+            entry["color"] = color_to_string(color, True)
+            entries.append(entry)
+            anim.duration = max(anim.duration, t)
+        curves = _read_v2_curves(r, frame_count)
+        for ci, cv in enumerate(curves):
+            if cv:
+                entries[ci].update(cv)
+        slot_name = sk.slots[slot_idx].name if 0 <= slot_idx < len(sk.slots) else ""
+        anim.slots.setdefault(slot_name, {})["color"] = entries
+
+    elif tl_type_v2 == V2TimelineType.Attachment:
+        slot_idx = r.read_u32()
+        frame_count = r.read_u32()
+        times = read_f32_array(r, frame_count)
+        name_offs = read_u32_array(r, frame_count)
+        entries = []
+        for fi in range(frame_count):
+            entry: Dict[str, Any] = {"time": round(times[fi], 4)}
+            name = get_pool_string(name_offs[fi], sk) if name_offs[fi] < 0xFFFF else None
+            entry["name"] = name if name else None
+            entries.append(entry)
+            anim.duration = max(anim.duration, times[fi])
+        slot_name = sk.slots[slot_idx].name if 0 <= slot_idx < len(sk.slots) else ""
+        anim.slots.setdefault(slot_name, {})["attachment"] = entries
+
+    elif tl_type_v2 == V2TimelineType.FFD:
+        frame_count = r.read_u32()
+        times = read_f32_array(r, frame_count)
+        r.skip(4)
+        verts_per_frame = r.read_u32()
+        all_verts: List[List[float]] = []
+        for fi in range(frame_count):
+            frame_verts = read_f32_array(r, verts_per_frame)
+            all_verts.append(frame_verts)
+            anim.duration = max(anim.duration, times[fi])
+        curves = _read_v2_curves(r, frame_count)
+        skin_record_id = r.read_u32()
+        record = sk.v2_skin_records[skin_record_id] if skin_record_id < len(sk.v2_skin_records) else {}
+        ffd_skin = record.get('skin', 'default')
+        ffd_slot = record.get('skin_slot', '')
+        ffd_att = record.get('skin_attachment', '')
+
+        setup_verts: List[float] = []
+        for s_obj in sk.skins:
+            if s_obj.name == ffd_skin:
+                att = s_obj.attachments.get(ffd_slot, {}).get(ffd_att)
+                if isinstance(att, VertexAttachment) and not att.isWeighted:
+                    setup_verts = att.vertices
+                break
+
+        entries = []
+        for fi in range(frame_count):
+            entry: Dict[str, Any] = {}
+            if fi < len(curves) and curves[fi]:
+                entry.update(curves[fi])
+            entry["time"] = round(times[fi], 4)
+            fv = all_verts[fi]
+            if setup_verts and len(fv) == len(setup_verts):
+                offsets = [fv[i] - setup_verts[i] for i in range(len(fv))]
+            else:
+                offsets = fv
+            all_zero = all(v == 0 for v in offsets)
+            if not all_zero:
+                entry["vertices"] = [round(v, 8) for v in offsets]
+            entries.append(entry)
+        anim.ffd.setdefault(ffd_skin, {}).setdefault(ffd_slot, {})[ffd_att] = entries
+
+    elif tl_type_v2 == V2TimelineType.IkConstraint:
+        ik_idx = r.read_u32()
+        raw_count = r.read_u32()
+        frame_count = raw_count // 3
+        entries = []
+        for fi in range(frame_count):
+            t = r.read_f32()
+            mix = r.read_f32()
+            bend = r.read_f32()
+            entry: Dict[str, Any] = {"time": round(t, 4)}
+            if round(mix, 4) != 1: entry["mix"] = round(mix, 4)
+            entry["bendPositive"] = (not math.isnan(bend)) and int(bend) >= 0
+            entries.append(entry)
+            anim.duration = max(anim.duration, t)
+        curves = _read_v2_curves(r, frame_count)
+        for ci, cv in enumerate(curves):
+            if cv:
+                entries[ci].update(cv)
+        ik_name = sk.ikConstraints[ik_idx].name if 0 <= ik_idx < len(sk.ikConstraints) else ""
+        anim.ik[ik_name] = entries
+
+    elif tl_type_v2 in (V2TimelineType.FlipX, V2TimelineType.FlipY):
+        bone_idx = r.read_u32()
+        frame_count = r.read_u32()
+        # Separated layout: contiguous f32 times, then contiguous byte values.
+        # Spine 2.1 flip feature is unsupported by the official runtime/viewer,
+        # so we consume the bytes for alignment but do NOT output to JSON.
+        r.skip(frame_count * 4)  # times
+        r.skip(frame_count)      # values
+
+    elif tl_type_v2 == V2TimelineType.DrawOrder:
+        slot_idx = r.read_u32()
+        offset = r.read_u32()
+        count = r.read_u32()
+        frame_count = count // 2
+        frames = []
+        for _ in range(frame_count):
+            t = r.read_f32()
+            activation = r.read_f32()
+            frames.append((round(t, 4), activation != 0.0))
+            anim.duration = max(anim.duration, t)
+        if slot_idx < len(sk.slots):
+            anim._v2_draworder_raw.append({
+                'slot_idx': slot_idx,
+                'offset': offset,
+                'frames': frames,
+            })
+
+    elif tl_type_v2 == V2TimelineType.Event:
+        _param1 = r.read_u32()
+        _param2 = r.read_u32()
+        count = r.read_u32()
+        r.skip(count * 4)
+
+    else:
+        return False
+
+    return True
+
+
+def _merge_v2_draworder(anim: 'AnimationData', sk: 'SkeletonData') -> None:
+    """Merge per-slot DrawOrder entries into a unified drawOrder timeline."""
+    raw = anim._v2_draworder_raw
+    if not raw:
+        return
+
+    all_times: set = set()
+    for entry in raw:
+        for t, _ in entry['frames']:
+            all_times.add(t)
+    sorted_times = sorted(all_times)
+
+    slot_state: Dict[int, Dict] = {}
+    for entry in raw:
+        slot_state[entry['slot_idx']] = {
+            'offset': entry['offset'],
+            'frames': entry['frames'],
+        }
+
+    for t in sorted_times:
+        offsets = []
+        for slot_idx in sorted(slot_state.keys()):
+            info = slot_state[slot_idx]
+            active = False
+            for ft, fa in info['frames']:
+                if ft <= t:
+                    active = fa
+                else:
+                    break
+            if active and info['offset'] != 0:
+                slot_name = sk.slots[slot_idx].name
+                offsets.append({"slot": slot_name, "offset": info['offset']})
+        keyframe: Dict[str, Any] = {"time": t}
+        if offsets:
+            keyframe["offsets"] = offsets
+        anim.drawOrder.append(keyframe)
+
+
+def _collect_anim_name_offsets(sk: SkeletonData) -> Set[int]:
+    """Collect string pool offsets for animation names by excluding known names."""
+    known_names: Set[str] = set()
+    for b in sk.bones:
+        known_names.add(b.name)
+    for sl in sk.slots:
+        known_names.add(sl.name)
+    for ik in sk.ikConstraints:
+        known_names.add(ik.name)
+    for skin in sk.skins:
+        known_names.add(skin.name)
+        for slot_name in skin.attachments:
+            known_names.add(slot_name)
+            for att_name, att_obj in skin.attachments[slot_name].items():
+                known_names.add(att_name)
+                if hasattr(att_obj, 'name') and att_obj.name:
+                    known_names.add(att_obj.name)
+                if hasattr(att_obj, 'path') and att_obj.path:
+                    known_names.add(att_obj.path)
+    for ev in sk.events:
+        known_names.add(ev.name)
+        if ev.stringValue:
+            known_names.add(ev.stringValue)
+    if sk.hashString:
+        known_names.add(sk.hashString)
+    if sk.version:
+        known_names.add(sk.version)
+        known_names.add(sk.version + ".scsp")
+
+    anim_offsets: Set[int] = set()
+    pool = sk.stringPool
+    i = 0
+    while i < len(pool):
+        end = pool.find(b'\x00', i)
+        if end == -1:
+            end = len(pool)
+        name = pool[i:end].decode('utf-8', errors='replace')
+        if name and name not in known_names and len(name) >= 2:
+            anim_offsets.add(i)
+        i = end + 1
+    return anim_offsets
+
+
+def _prescan_v2_anim_headers(r: SpineBinaryReader, sk: SkeletonData,
+                              anim_start: int,
+                              anim_name_offsets: Set[int]) -> List[int]:
+    """Pre-scan data to find all animation header positions."""
+    bone_count = len(sk.bones) if sk.bones else sk.v2_bone_count
+    slot_count = len(sk.slots) if sk.slots else sk.v2_slot_count
+    data = r.data
+    headers: List[int] = []
+    seen_names: Set[int] = set()
+
+    for pos in range(anim_start, len(data) - 20):
+        name_off = struct.unpack_from("<I", data, pos)[0]
+        if name_off not in anim_name_offsets or name_off in seen_names:
+            continue
+        ec = struct.unpack_from("<I", data, pos + 8)[0]
+        if ec < 1 or ec > 5000:
+            continue
+        ft = struct.unpack_from("<I", data, pos + 12)[0]
+        if ft > 10:
+            continue
+        fi = struct.unpack_from("<I", data, pos + 16)[0]
+        if ft in (0, 1, 2, 5, 6) and fi >= bone_count:
+            continue
+        if ft in (3, 4) and fi >= slot_count:
+            continue
+        seen_names.add(name_off)
+        headers.append(pos)
+
+    headers.sort()
+    return headers
+
+
+def read_animations_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
+    animations: List[AnimationData] = []
+    anim_start = r.pos
+
+    anim_name_offsets = _collect_anim_name_offsets(sk)
+    header_positions = _prescan_v2_anim_headers(r, sk, anim_start, anim_name_offsets)
+
+    if len(header_positions) != sk.v2_anim_count:
+        logging.warning(
+            f"Pre-scan found {len(header_positions)} animation headers, "
+            f"expected {sk.v2_anim_count}"
+        )
+
+    for ai in range(len(header_positions)):
+        r.reset_pos(header_positions[ai])
         anim = AnimationData()
-        anim.name = get_pool_string(r.read_u32(), sk)
-        r.skip(4)  # unknown
-        elem_count = r.read_u32()
-        anim.duration = 0.0
+        try:
+            anim.name = get_pool_string(r.read_u32(), sk)
+            anim.duration = r.read_f32()
+            elem_count = r.read_u32()
+        except (EOFError, struct.error):
+            break
+
+        boundary = header_positions[ai + 1] if ai + 1 < len(header_positions) else len(r.data)
 
         for _ in range(elem_count):
-            tl_type_v2 = r.read_u32()
+            if r.pos >= boundary:
+                break
+            try:
+                tl_type_v2 = r.read_u32()
+            except (EOFError, struct.error):
+                break
 
-            if tl_type_v2 == V2TimelineType.Scale:
-                bone_idx = r.read_u32()
-                raw_count = r.read_u32()
-                frame_count = raw_count // 3
-                entries = []
-                for fi in range(frame_count):
-                    t, x, y = r.read_f32(), r.read_f32(), r.read_f32()
-                    entry: Dict[str, Any] = {"time": round(t, 4)}
-                    entry["x"] = round(x, 4)
-                    entry["y"] = round(y, 4)
-                    entries.append(entry)
-                    anim.duration = max(anim.duration, t)
-                curves = _read_v2_curves(r, frame_count)
-                for ci, cv in enumerate(curves):
-                    if cv:
-                        entries[ci].update(cv)
-                bone_name = sk.bones[bone_idx].name if 0 <= bone_idx < len(sk.bones) else ""
-                anim.bones.setdefault(bone_name, {})["scale"] = entries
+            try:
+                _parse_ok = _parse_v2_timeline_entry(r, sk, anim, tl_type_v2)
+            except (EOFError, struct.error, ValueError, OverflowError):
+                break
+            if not _parse_ok:
+                break
 
-            elif tl_type_v2 == V2TimelineType.Rotate:
-                bone_idx = r.read_u32()
-                raw_count = r.read_u32()
-                frame_count = raw_count // 2
-                entries = []
-                for fi in range(frame_count):
-                    t, angle = r.read_f32(), r.read_f32()
-                    entry: Dict[str, Any] = {"time": round(t, 4), "angle": round(angle, 4)}
-                    entries.append(entry)
-                    anim.duration = max(anim.duration, t)
-                curves = _read_v2_curves(r, frame_count)
-                for ci, cv in enumerate(curves):
-                    if cv:
-                        entries[ci].update(cv)
-                bone_name = sk.bones[bone_idx].name if 0 <= bone_idx < len(sk.bones) else ""
-                anim.bones.setdefault(bone_name, {})["rotate"] = entries
-
-            elif tl_type_v2 == V2TimelineType.Translate:
-                bone_idx = r.read_u32()
-                raw_count = r.read_u32()
-                frame_count = raw_count // 3
-                entries = []
-                for fi in range(frame_count):
-                    t, x, y = r.read_f32(), r.read_f32(), r.read_f32()
-                    entry: Dict[str, Any] = {"time": round(t, 4)}
-                    if round(x, 4) != 0: entry["x"] = round(x, 4)
-                    if round(y, 4) != 0: entry["y"] = round(y, 4)
-                    entries.append(entry)
-                    anim.duration = max(anim.duration, t)
-                curves = _read_v2_curves(r, frame_count)
-                for ci, cv in enumerate(curves):
-                    if cv:
-                        entries[ci].update(cv)
-                bone_name = sk.bones[bone_idx].name if 0 <= bone_idx < len(sk.bones) else ""
-                anim.bones.setdefault(bone_name, {})["translate"] = entries
-
-            elif tl_type_v2 == V2TimelineType.Color:
-                slot_idx = r.read_u32()
-                raw_count = r.read_u32()
-                frame_count = raw_count // 5
-                entries = []
-                for fi in range(frame_count):
-                    t = r.read_f32()
-                    cr, cg, cb, ca = r.read_f32(), r.read_f32(), r.read_f32(), r.read_f32()
-                    color = f32_color(cr, cg, cb, ca)
-                    entry: Dict[str, Any] = {"time": round(t, 4)}
-                    entry["color"] = color_to_string(color, True)
-                    entries.append(entry)
-                    anim.duration = max(anim.duration, t)
-                curves = _read_v2_curves(r, frame_count)
-                for ci, cv in enumerate(curves):
-                    if cv:
-                        entries[ci].update(cv)
-                slot_name = sk.slots[slot_idx].name if 0 <= slot_idx < len(sk.slots) else ""
-                anim.slots.setdefault(slot_name, {})["color"] = entries
-
-            elif tl_type_v2 == V2TimelineType.Attachment:
-                slot_idx = r.read_u32()
-                frame_count = r.read_u32()
-                times = read_f32_array(r, frame_count)
-                name_offs = read_u32_array(r, frame_count)
-                entries = []
-                for fi in range(frame_count):
-                    entry: Dict[str, Any] = {"time": round(times[fi], 4)}
-                    name = get_pool_string(name_offs[fi], sk) if name_offs[fi] < 0xFFFF else None
-                    entry["name"] = name if name else None
-                    entries.append(entry)
-                    anim.duration = max(anim.duration, times[fi])
-                slot_name = sk.slots[slot_idx].name if 0 <= slot_idx < len(sk.slots) else ""
-                anim.slots.setdefault(slot_name, {})["attachment"] = entries
-
-            elif tl_type_v2 == V2TimelineType.FFD:
-                frame_count = r.read_u32()
-                times = read_f32_array(r, frame_count)
-                r.skip(4)  # unknown
-                verts_per_frame = r.read_u32()
-                all_verts: List[List[float]] = []
-                for fi in range(frame_count):
-                    frame_verts = read_f32_array(r, verts_per_frame)
-                    all_verts.append(frame_verts)
-                    anim.duration = max(anim.duration, times[fi])
-                curves = _read_v2_curves(r, frame_count)
-                skin_record_id = r.read_u32()
-                record = sk.v2_skin_records[skin_record_id] if skin_record_id < len(sk.v2_skin_records) else {}
-                ffd_skin = record.get('skin', 'default')
-                ffd_slot = record.get('skin_slot', '')
-                ffd_att = record.get('skin_attachment', '')
-
-                # V2 FFD stores absolute vertex positions; convert to offsets
-                setup_verts: List[float] = []
-                for s in sk.skins:
-                    if s.name == ffd_skin:
-                        att = s.attachments.get(ffd_slot, {}).get(ffd_att)
-                        if isinstance(att, VertexAttachment) and not att.isWeighted:
-                            setup_verts = att.vertices
-                        break
-
-                entries = []
-                for fi in range(frame_count):
-                    entry: Dict[str, Any] = {}
-                    if fi < len(curves) and curves[fi]:
-                        entry.update(curves[fi])
-                    entry["time"] = round(times[fi], 4)
-                    fv = all_verts[fi]
-                    if setup_verts and len(fv) == len(setup_verts):
-                        offsets = [fv[i] - setup_verts[i] for i in range(len(fv))]
-                    else:
-                        offsets = fv
-                    all_zero = all(v == 0 for v in offsets)
-                    if not all_zero:
-                        entry["vertices"] = [round(v, 8) for v in offsets]
-                    entries.append(entry)
-                anim.ffd.setdefault(ffd_skin, {}).setdefault(ffd_slot, {})[ffd_att] = entries
-
-            elif tl_type_v2 == V2TimelineType.IkConstraint:
-                # V2 IK constraint timeline - not commonly seen but handle it
-                ik_idx = r.read_u32()
-                raw_count = r.read_u32()
-                frame_count = raw_count // 3
-                entries = []
-                for fi in range(frame_count):
-                    t = r.read_f32()
-                    mix = r.read_f32()
-                    bend = r.read_f32()
-                    entry: Dict[str, Any] = {"time": round(t, 4)}
-                    if round(mix, 4) != 1: entry["mix"] = round(mix, 4)
-                    entry["bendPositive"] = int(bend) >= 0
-                    entries.append(entry)
-                    anim.duration = max(anim.duration, t)
-                curves = _read_v2_curves(r, frame_count)
-                for ci, cv in enumerate(curves):
-                    if cv:
-                        entries[ci].update(cv)
-                ik_name = sk.ikConstraints[ik_idx].name if 0 <= ik_idx < len(sk.ikConstraints) else ""
-                anim.ik[ik_name] = entries
-
-            elif tl_type_v2 in (V2TimelineType.FlipX, V2TimelineType.FlipY):
-                bone_idx = r.read_u32()
-                frame_count = r.read_u32()
-                for _ in range(frame_count):
-                    r.read_f32()  # time
-                    r.read_byte()  # flip value (boolean, 1 byte)
-            else:
-                raise ValueError(f"Unknown V2 timeline type: {tl_type_v2} at pos {r.pos}")
-
-        # Some V2 animations store draw order data after the timelines.
-        # Skip it by scanning forward to the next valid animation header.
-        if ai < sk.v2_anim_count - 1:
-            if not _peek_valid_v2_anim_header(r, sk):
-                while r.pos + 16 <= len(r.data):
-                    r.pos += 4
-                    if _peek_valid_v2_anim_header(r, sk):
-                        break
-
+        _merge_v2_draworder(anim, sk)
         animations.append(anim)
     sk.animations = animations
 
@@ -1572,6 +1861,7 @@ def read_scsp_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
     read_iks_v2(r, sk)
     read_slots_v2(r, sk)
     read_skins_v2(r, sk)
+    read_events_v2(r, sk)
     read_animations_v2(r, sk)
 
 
@@ -1833,8 +2123,10 @@ def write_json_data(sk: SkeletonData) -> Dict[str, Any]:
             if b.scaleY != 1.0: obj["scaleY"] = round(b.scaleY, 5)
             if b.flipX: obj["flipX"] = True
             if b.flipY: obj["flipY"] = True
-            if not b.inheritScale: obj["inheritScale"] = False
-            if not b.inheritRotation: obj["inheritRotation"] = False
+            if not b.inheritScale:
+                obj["transform"] = "noScale"
+            if not b.inheritRotation:
+                obj["inheritRotation"] = False
         else:
             if b.length != 0.0: obj["length"] = b.length
             if b.x != 0.0: obj["x"] = b.x
@@ -1986,6 +2278,9 @@ def write_json_data(sk: SkeletonData) -> Dict[str, Any]:
                         a_obj["hull"] = att.hullLength
                         if att.uvs: a_obj["uvs"] = [_clean_float(round(u, 8)) for u in att.uvs]
                         if att.triangles: a_obj["triangles"] = att.triangles
+                    elif isinstance(att, BoundingBoxAttachment):
+                        a_obj["type"] = "boundingbox"
+                        if att.vertices: a_obj["vertexCount"] = att.vertexCount; a_obj["vertices"] = att.vertices
 
                     if hasattr(att, 'color') and att.color:
                         a_obj["color"] = color_to_string(att.color, True)
@@ -2065,7 +2360,15 @@ def write_json_data(sk: SkeletonData) -> Dict[str, Any]:
 
     # events
     if is_v2:
-        pass  # V2 typically has no events
+        if sk.events:
+            ev_obj_v2: Dict[str, Any] = {}
+            for e in sk.events:
+                item_v2: Dict[str, Any] = {}
+                if e.intValue != 0: item_v2["int"] = e.intValue
+                if e.floatValue != 0.0: item_v2["float"] = e.floatValue
+                if e.stringValue is not None and e.stringValue != "": item_v2["string"] = e.stringValue
+                ev_obj_v2[e.name] = item_v2
+            j["events"] = ev_obj_v2
     else:
         ev_obj: Dict[str, Any] = {}
         for e in sk.events:

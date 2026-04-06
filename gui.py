@@ -21,7 +21,7 @@ from tkinter import (
 from sct2png import convert_sct_to_png
 from scsp2json import convert_scsp_to_json
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 # ==============================
 # i18n
@@ -362,13 +362,30 @@ class App:
             return [(t("ft_atlas"), "*.atlas"), (t("ft_all"), "*.*")]
 
     # ---- helpers ----
+    _EXT_MAP = {"sct": ".sct", "scsp": ".scsp", "atlas": ".atlas"}
+
+    def _auto_fill_siblings(self, chosen_path: str, chosen_kind: str) -> None:
+        """When one input file is selected, fill the other two if matching files exist."""
+        p = Path(chosen_path)
+        stem, folder = p.stem, p.parent
+        kind_to_var = {"sct": self.sct_path, "scsp": self.scsp_path, "atlas": self.atlas_path}
+        for kind, var in kind_to_var.items():
+            if kind == chosen_kind:
+                continue
+            if var.get():
+                continue
+            candidate = folder / (stem + self._EXT_MAP[kind])
+            if candidate.is_file():
+                var.set(candidate.as_posix())
+
     def _browse_file(self, var: StringVar, kind: str) -> None:
-        init_dir = str(Path(var.get()).parent) if var.get() else None
+        init_dir = Path(var.get()).parent.as_posix() if var.get() else None
         path = filedialog.askopenfilename(filetypes=self._ft(kind), initialdir=init_dir)
         if path:
             var.set(path)
+            self._auto_fill_siblings(path, kind)
             if not self.out_dir.get():
-                self.out_dir.set(str(Path(path).parent))
+                self.out_dir.set(Path(path).parent.as_posix())
 
     def _browse_dir(self, var: StringVar) -> None:
         init_dir = var.get() or None
@@ -431,7 +448,7 @@ class App:
                 return ok, total
             self.root.after(0, self._log, f"  [SCT]   {Path(sct).name}")
             try:
-                out_png = str(Path(out_dir) / Path(sct).with_suffix(".png").name)
+                out_png = (Path(out_dir) / Path(sct).with_suffix(".png").name).as_posix()
                 if convert_sct_to_png(sct, out_png):
                     self.root.after(0, self._log, f"          → {out_png}")
                     ok += 1
@@ -450,7 +467,7 @@ class App:
                 return ok, total
             self.root.after(0, self._log, f"  [SCSP]  {Path(scsp).name}")
             try:
-                out_json = str(Path(out_dir) / Path(scsp).with_suffix(".json").name)
+                out_json = (Path(out_dir) / Path(scsp).with_suffix(".json").name).as_posix()
                 if convert_scsp_to_json(scsp, out_json):
                     self.root.after(0, self._log, f"          → {out_json}")
                     ok += 1
@@ -469,7 +486,7 @@ class App:
                 return ok, total
             self.root.after(0, self._log, f"  [ATLAS] {Path(atlas).name}")
             try:
-                out_atlas = str(Path(out_dir) / Path(atlas).name)
+                out_atlas = (Path(out_dir) / Path(atlas).name).as_posix()
                 fix_atlas_sct_ref(atlas, out_atlas)
                 if self.fix_atlas_pma.get():
                     from fix_atlas import fix_atlas
@@ -553,16 +570,16 @@ class App:
                 first = sct_p or scsp_p or atlas_p
                 if recursive and first:
                     rel = first.parent.relative_to(in_dir)
-                    dest = str(Path(out_dir) / rel)
+                    dest = (Path(out_dir) / rel).as_posix()
                 else:
                     dest = out_dir
 
                 Path(dest).mkdir(parents=True, exist_ok=True)
 
                 ok, cnt = self._convert_one_group(
-                    str(sct_p) if sct_p else "",
-                    str(scsp_p) if scsp_p else "",
-                    str(atlas_p) if atlas_p else "",
+                    sct_p.as_posix() if sct_p else "",
+                    scsp_p.as_posix() if scsp_p else "",
+                    atlas_p.as_posix() if atlas_p else "",
                     dest,
                     all_failures,
                 )
