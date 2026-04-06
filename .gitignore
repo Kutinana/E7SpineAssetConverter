@@ -1,0 +1,9 @@
+__pycache__/
+dist/
+build/
+references/
+output/
+spine-runtimes-2.1.27-master/
+sample_files/
+*.spec
+*.exe
