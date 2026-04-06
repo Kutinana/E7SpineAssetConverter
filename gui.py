@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 from tkinter import (
@@ -21,7 +22,7 @@ from tkinter import (
 from sct2png import convert_sct_to_png
 from scsp2json import convert_scsp_to_json
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 # ==============================
 # i18n
@@ -60,6 +61,7 @@ STRINGS: dict[str, dict[str, str]] = {
                            "en": "Batch done: {gok}/{gtotal} group(s) fully succeeded, {fok}/{ftotal} file(s) total."},
     "stop":               {"zh": "停止",                           "en": "Stop"},
     "cancelled":          {"zh": "转换已被用户取消。",               "en": "Conversion cancelled by user."},
+    "elapsed":            {"zh": "耗时: {t}",                       "en": "Elapsed: {t}"},
     "fail":               {"zh": "失败",                           "en": "FAIL"},
     "fail_summary_header": {"zh": "━━ 失败文件列表 ({n} 个) ━━",   "en": "━━ Failed files ({n}) ━━"},
     "ft_sct":             {"zh": "SCT 纹理",                       "en": "SCT Texture"},
@@ -149,6 +151,108 @@ def scan_folder_groups(folder: str, recursive: bool = False) -> dict[str, dict[s
 
 
 # ==============================
+# Windows Taskbar Progress
+# ==============================
+class TaskbarProgress:
+    """ITaskbarList3 wrapper for Windows taskbar progress indicator."""
+
+    TBPF_NOPROGRESS = 0
+    TBPF_NORMAL = 2
+    TBPF_PAUSED = 8
+
+    def __init__(self, hwnd: int) -> None:
+        self._hwnd = hwnd
+        self._ptr = None
+        self._set_value = None
+        self._set_state = None
+        if sys.platform != "win32":
+            return
+        try:
+            self._init_com()
+        except Exception:
+            pass
+
+    def _init_com(self) -> None:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        clsid = GUID(0x56FDF344, 0xFD6D, 0x11d0,
+                      (ctypes.c_ubyte * 8)(0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90))
+        iid = GUID(0xea1afb91, 0x9e28, 0x4b86,
+                    (ctypes.c_ubyte * 8)(0x90, 0xe9, 0x9e, 0x9f, 0x8a, 0x5e, 0xef, 0xaf))
+
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitialize(None)
+
+        ptr = ctypes.c_void_p()
+        hr = ole32.CoCreateInstance(
+            ctypes.byref(clsid), None, 1,
+            ctypes.byref(iid), ctypes.byref(ptr),
+        )
+        if hr != 0 or not ptr:
+            return
+
+        vt_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_void_p))[0]
+        vt = ctypes.cast(vt_ptr, ctypes.POINTER(ctypes.c_void_p * 21)).contents
+
+        # HrInit (vtable index 3)
+        ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p)(vt[3])(ptr)
+
+        self._set_value = ctypes.WINFUNCTYPE(
+            ctypes.HRESULT, ctypes.c_void_p, wt.HWND,
+            ctypes.c_ulonglong, ctypes.c_ulonglong,
+        )(vt[9])
+        self._set_state = ctypes.WINFUNCTYPE(
+            ctypes.HRESULT, ctypes.c_void_p, wt.HWND, ctypes.c_int,
+        )(vt[10])
+        self._ptr = ptr
+
+    def set_progress(self, current: int, total: int) -> None:
+        if self._ptr and self._set_value and self._set_state:
+            self._set_state(self._ptr, self._hwnd, self.TBPF_NORMAL)
+            self._set_value(self._ptr, self._hwnd, current, total)
+
+    def set_state(self, state: int) -> None:
+        if self._ptr and self._set_state:
+            self._set_state(self._ptr, self._hwnd, state)
+
+    def clear(self) -> None:
+        self.set_state(self.TBPF_NOPROGRESS)
+
+
+def _flash_window(hwnd: int) -> None:
+    """Flash the taskbar button (orange blink) to attract user attention."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint), ("hwnd", wt.HWND),
+                ("dwFlags", ctypes.c_uint), ("uCount", ctypes.c_uint),
+                ("dwTimeout", ctypes.c_uint),
+            ]
+
+        finfo = FLASHWINFO()
+        finfo.cbSize = ctypes.sizeof(FLASHWINFO)
+        finfo.hwnd = hwnd
+        finfo.dwFlags = 0x03 | 0x0C  # FLASHW_ALL | FLASHW_TIMERNOFG
+        finfo.uCount = 0
+        finfo.dwTimeout = 0
+        ctypes.windll.user32.FlashWindowEx(ctypes.byref(finfo))
+    except Exception:
+        pass
+
+
+# ==============================
 # GUI
 # ==============================
 class App:
@@ -170,6 +274,7 @@ class App:
 
         self._widgets: dict[str, object] = {}
         self._cancel_event = threading.Event()
+        self._tb: TaskbarProgress | None = None
 
         self._build_ui()
         self._center_window()
@@ -409,6 +514,38 @@ class App:
         self.stop_btn.configure(state=stop_state)
         self.batch_stop_btn.configure(state=stop_state)
 
+    @staticmethod
+    def _fmt_elapsed(seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.2f}s"
+        m, s = divmod(seconds, 60)
+        return f"{int(m)}m {s:.2f}s"
+
+    # ---- taskbar progress ----
+    def _init_taskbar(self) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            self._tb = TaskbarProgress(hwnd)
+        except Exception:
+            pass
+
+    def _tb_progress(self, current: int, total: int) -> None:
+        if self._tb:
+            self._tb.set_progress(current, total)
+
+    def _tb_complete(self) -> None:
+        if self._tb:
+            self._tb.set_progress(1, 1)
+            _flash_window(self._tb._hwnd)
+            self.root.after(4000, self._tb_clear)
+
+    def _tb_clear(self) -> None:
+        if self._tb:
+            self._tb.clear()
+
     def _on_stop(self) -> None:
         self._cancel_event.set()
 
@@ -434,10 +571,12 @@ class App:
     def _convert_one_group(
         self, sct: str, scsp: str, atlas: str, out_dir: str,
         failures: list[str] | None = None,
+        on_file_done=None,
     ) -> tuple[int, int]:
         """Convert one set of files. Returns (success_count, total_count).
 
         If *failures* is provided, failed file paths are appended to it.
+        *on_file_done* is called (no args) after each file finishes.
         """
         t = self.i.t
         ok = 0
@@ -461,6 +600,8 @@ class App:
                 if failures is not None:
                     failures.append(sct)
                 traceback.print_exc()
+            if on_file_done:
+                on_file_done()
 
         if scsp:
             if self._cancel_event.is_set():
@@ -480,6 +621,8 @@ class App:
                 if failures is not None:
                     failures.append(scsp)
                 traceback.print_exc()
+            if on_file_done:
+                on_file_done()
 
         if atlas:
             if self._cancel_event.is_set():
@@ -498,6 +641,8 @@ class App:
                 if failures is not None:
                     failures.append(atlas)
                 traceback.print_exc()
+            if on_file_done:
+                on_file_done()
 
         return ok, total
 
@@ -511,15 +656,28 @@ class App:
         self.root.after(0, self._log, "")
 
     def _do_convert(self, sct: str, scsp: str, atlas: str, out_dir: str) -> None:
+        t0 = time.perf_counter()
+        file_count = sum(1 for p in [sct, scsp, atlas] if p)
+        done = [0]
+
+        def on_file_done():
+            done[0] += 1
+            self.root.after(0, self._tb_progress, done[0], file_count)
+
+        self.root.after(0, self._tb_progress, 0, file_count)
         try:
             Path(out_dir).mkdir(parents=True, exist_ok=True)
             failures: list[str] = []
-            ok, total = self._convert_one_group(sct, scsp, atlas, out_dir, failures)
+            ok, total = self._convert_one_group(sct, scsp, atlas, out_dir, failures, on_file_done)
+            elapsed = self._fmt_elapsed(time.perf_counter() - t0)
             if self._cancel_event.is_set():
-                self.root.after(0, self._log, "\n" + self.i.t("cancelled") + "\n")
+                self.root.after(0, self._log, "\n" + self.i.t("cancelled"))
+                self.root.after(0, self._tb_clear)
             else:
-                self.root.after(0, self._log, "\n" + self.i.t("done_single", ok=ok, total=total) + "\n")
+                self.root.after(0, self._log, "\n" + self.i.t("done_single", ok=ok, total=total))
                 self._log_failure_summary(failures)
+                self.root.after(0, self._tb_complete)
+            self.root.after(0, self._log, self.i.t("elapsed", t=elapsed) + "\n")
         finally:
             self.root.after(0, self._set_buttons, NORMAL)
 
@@ -545,6 +703,7 @@ class App:
         threading.Thread(target=self._do_batch, args=(in_dir, out_dir, recursive), daemon=True).start()
 
     def _do_batch(self, in_dir: str, out_dir: str, recursive: bool) -> None:
+        t0 = time.perf_counter()
         try:
             groups = scan_folder_groups(in_dir, recursive)
             if not groups:
@@ -552,6 +711,15 @@ class App:
                 return
 
             self.root.after(0, self._log, self.i.t("batch_scan", n=len(groups)) + "\n")
+
+            all_file_count = sum(len(fm) for fm in groups.values())
+            done = [0]
+
+            def on_file_done():
+                done[0] += 1
+                self.root.after(0, self._tb_progress, done[0], all_file_count)
+
+            self.root.after(0, self._tb_progress, 0, all_file_count)
 
             total_ok = 0
             total_files = 0
@@ -582,25 +750,31 @@ class App:
                     atlas_p.as_posix() if atlas_p else "",
                     dest,
                     all_failures,
+                    on_file_done,
                 )
                 total_ok += ok
                 total_files += cnt
                 if ok == cnt:
                     group_ok += 1
 
+            elapsed = self._fmt_elapsed(time.perf_counter() - t0)
             if self._cancel_event.is_set():
-                self.root.after(0, self._log, "\n" + self.i.t("cancelled") + "\n")
+                self.root.after(0, self._log, "\n" + self.i.t("cancelled"))
+                self.root.after(0, self._tb_clear)
             else:
                 self.root.after(
                     0, self._log,
                     "\n" + self.i.t("batch_done", gok=group_ok, gtotal=len(groups),
-                                    fok=total_ok, ftotal=total_files) + "\n",
+                                    fok=total_ok, ftotal=total_files),
                 )
                 self._log_failure_summary(all_failures)
+                self.root.after(0, self._tb_complete)
+            self.root.after(0, self._log, self.i.t("elapsed", t=elapsed) + "\n")
         finally:
             self.root.after(0, self._set_buttons, NORMAL)
 
     def run(self) -> None:
+        self.root.after(0, self._init_taskbar)
         self.root.mainloop()
 
 
