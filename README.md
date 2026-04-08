@@ -19,7 +19,7 @@ Convert Epic Seven Spine assets (`.sct`, `.scsp`, `.atlas`) into standard format
 pip install -r requirements.txt
 ```
 
-Required packages: `lz4`, `Pillow`, `texture2ddecoder`.
+Required packages: `lz4`, `Pillow`, `texture2ddecoder`, `numpy`.
 
 ## Usage
 
