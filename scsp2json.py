@@ -62,21 +62,42 @@ def read_binary_skeleton(data: bytes) -> Tuple[SkeletonData, bool]:
 # ==============================
 # Post-processing: ensure loop-safe animations
 # ==============================
-def _ensure_setup_keyframes(sk: SkeletonData) -> None:
-    """Prepend t=0 setup-pose keyframes for timelines that start after t=0.
+def _add_cross_anim_resets(sk: SkeletonData, slot_by_name: Dict[str, Any]) -> None:
+    """For every slot modified by any animation, ensure all other animations
+    include a t=0 attachment reset to the setup pose value.
 
-    The Spine runtime does NOT reset properties to setup pose on animation
-    loop.  If a timeline's first keyframe is at t>0, the end-of-animation
-    value leaks into the next loop iteration (e.g. alpha=0 persists,
-    making slots invisible).  The SCSP source data relies on the game
-    engine resetting state each cycle, so we patch in explicit t=0
-    keyframes for compatibility with standard Spine viewers.
+    Without this, switching from animation A (which sets slot X visible) to
+    animation B (which never mentions slot X) leaves slot X visible — the
+    Spine runtime keeps the previous value.
     """
-    slot_by_name = {s.name: s for s in sk.slots}
-    bone_by_name = {b.name: b for b in sk.bones}
+    if len(sk.animations) < 2:
+        return
+
+    # Collect the union of all slot names that have attachment timelines
+    dirty_slots: set = set()
+    for anim in sk.animations:
+        for slot_name, timelines in anim.slots.items():
+            att = timelines.get("attachment")
+            if isinstance(att, list) and att:
+                dirty_slots.add(slot_name)
+
+    if not dirty_slots:
+        return
 
     for anim in sk.animations:
-        _patch_anim_setup_keyframes(anim, slot_by_name, bone_by_name)
+        for slot_name in dirty_slots:
+            timelines = anim.slots.get(slot_name, {})
+            att = timelines.get("attachment")
+            if isinstance(att, list) and att:
+                continue  # already has an attachment timeline
+
+            slot = slot_by_name.get(slot_name)
+            if slot is None:
+                continue
+
+            anim.slots.setdefault(slot_name, {})["attachment"] = [
+                {"time": 0, "name": slot.attachmentName}
+            ]
 
 
 def _patch_anim_setup_keyframes(
@@ -439,11 +460,15 @@ def write_json_data(sk: SkeletonData) -> Dict[str, Any]:
     if sk.animations:
         slot_by_name = {s.name: s for s in sk.slots}
         bone_by_name = {b.name: b for b in sk.bones}
-        anims: Dict[str, Any] = {}
+        # Pass 1: ensure t=0 keyframes for late-starting timelines
         for anim in sk.animations:
             if not is_v2:
                 build_animation_json_v3(anim, sk)
             _patch_anim_setup_keyframes(anim, slot_by_name, bone_by_name)
+        # Pass 2: cross-animation attachment resets
+        _add_cross_anim_resets(sk, slot_by_name)
+        anims: Dict[str, Any] = {}
+        for anim in sk.animations:
             a_obj: Dict[str, Any] = {}
             if anim.slots: a_obj["slots"] = anim.slots
             if anim.bones: a_obj["bones"] = anim.bones
