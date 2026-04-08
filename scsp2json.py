@@ -427,6 +427,7 @@ class AnimationData:
     drawOrder: List[Any] = field(default_factory=list)
     events: List[Any] = field(default_factory=list)
     _v2_draworder_raw: List[Any] = field(default_factory=list)
+    _v2_trailing_arrays: List[List[int]] = field(default_factory=list)
 
 @dataclass
 class SkeletonData:
@@ -460,6 +461,7 @@ class SkeletonData:
     v2_event_count: int = 0
     v2_anim_count: int = 0
     v2_skin_records: List[Dict] = field(default_factory=list)
+    _v2_used_pool_offsets: Set[int] = field(default_factory=set)
 
 
 # ==============================
@@ -1221,6 +1223,7 @@ def read_skeleton_info_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
         hash_off = r.read_u32()
         ver_off = r.read_u32()
 
+    sk._v2_used_pool_offsets.update((hash_off, ver_off))
     sk.hashString = get_pool_string(hash_off, sk)
     ver_str = get_pool_string(ver_off, sk)
     if ver_str and ".scsp" in ver_str:
@@ -1244,6 +1247,7 @@ def read_bones_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
         bone.inheritRotation = r.read_u32() > 0
         name_off = r.read_u32()
         parent_idx = r.read_u16()
+        sk._v2_used_pool_offsets.add(name_off)
         bone.name = get_pool_string(name_off, sk)
         if parent_idx < len(bones):
             bone.parent = bones[parent_idx].name
@@ -1259,6 +1263,9 @@ def read_slots_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
         att_off = r.read_u32()
         cr, cg, cb, ca = r.read_f32(), r.read_f32(), r.read_f32(), r.read_f32()
         blend = r.read_u32()
+        sk._v2_used_pool_offsets.add(name_off)
+        if att_off != 0xFFFFFFFF:
+            sk._v2_used_pool_offsets.add(att_off)
         slot.name = get_pool_string(name_off, sk)
         slot.bone = sk.bones[bone_idx].name if 0 <= bone_idx < len(sk.bones) else None
         slot.color = f32_color(cr, cg, cb, ca)
@@ -1277,6 +1284,7 @@ def read_iks_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
         target_idx = r.read_u16()
         ik.mix = r.read_f32()
         bend = r.read_i32()
+        sk._v2_used_pool_offsets.add(name_off)
         ik.name = get_pool_string(name_off, sk)
         ik.bendPositive = bend > 0
         ik.target = sk.bones[target_idx].name if 0 <= target_idx < len(sk.bones) else None
@@ -1294,6 +1302,7 @@ def read_skins_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
         skin = SkinData()
         skin_name_off = r.read_u32()
         part_count = r.read_u16()
+        sk._v2_used_pool_offsets.add(skin_name_off)
         skin.name = get_pool_string(skin_name_off, sk)
         attachments: Dict[str, Dict[str, Attachment]] = defaultdict(dict)
 
@@ -1302,6 +1311,7 @@ def read_skins_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
             slot_idx = r.read_u32()
             data_type = r.read_u32()
 
+            sk._v2_used_pool_offsets.add(att_name_off)
             att_name = get_pool_string(att_name_off, sk)
             slot_name = sk.slots[slot_idx].name if 0 <= slot_idx < len(sk.slots) else None
 
@@ -1312,14 +1322,13 @@ def read_skins_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
             })
 
             if data_type == V2AttachmentType.BoundingBox:
-                # BoundingBox has a different header: item_name(u32) + vertex_count(u32),
-                # with NO item_path field (unlike Region/Mesh/SkinnedMesh).
                 item_name_off = r.read_u32()
                 vert_count = r.read_u32()
                 verts = read_f32_array(r, vert_count)
                 att = BoundingBoxAttachment()
                 att.vertices = verts
                 att.vertexCount = vert_count // 2
+                sk._v2_used_pool_offsets.add(item_name_off)
                 att.name = get_pool_string(item_name_off, sk)
                 att.type = AttachmentType.Boundingbox
                 attachments[slot_name][att_name] = att
@@ -1327,6 +1336,7 @@ def read_skins_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
 
             item_name_off = r.read_u32()
             item_path_off = r.read_u32()
+            sk._v2_used_pool_offsets.update((item_name_off, item_path_off))
             item_name = get_pool_string(item_name_off, sk)
             item_path = get_pool_string(item_path_off, sk)
 
@@ -1356,6 +1366,7 @@ def read_skins_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
                 vert_count = r.read_u32()
                 verts = read_f32_array(r, vert_count)
                 hull = r.read_u32()
+                # Mesh stores atlas UV first, then region UV (reversed vs SkinnedMesh)
                 _uvs_atlas = read_f32_array(r, vert_count)
                 uvs_region = read_f32_array(r, vert_count)
                 tri_count = r.read_u32()
@@ -1383,11 +1394,9 @@ def read_skins_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
                 tri_cnt = r.read_u32()
                 tris = read_u32_array(r, tri_cnt)
                 uv_cnt = r.read_u32()
-                all_uvs: List[float] = []
-                for _ in range(uv_cnt):
-                    all_uvs.append(r.read_f32())
-                    all_uvs.append(r.read_f32())
-                uvs_region = all_uvs[:len(all_uvs) // 2]
+                # SkinnedMesh stores region UV first, then atlas UV (reversed vs Mesh)
+                uvs_region = read_f32_array(r, uv_cnt)
+                _uvs_atlas = read_f32_array(r, uv_cnt)
                 hull = r.read_u32()
                 att.color = f32_color(r.read_f32(), r.read_f32(), r.read_f32(), r.read_f32())
                 r.skip(48)
@@ -1572,6 +1581,7 @@ def read_events_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
         ev.intValue = r.read_i32()
         ev.floatValue = r.read_f32()
         str_off = r.read_u32()
+        sk._v2_used_pool_offsets.update((name_off, str_off))
         ev.name = get_pool_string(name_off, sk)
         ev.stringValue = get_pool_string(str_off, sk)
         events.append(ev)
@@ -1739,7 +1749,15 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
     elif tl_type_v2 in (V2TimelineType.FlipX, V2TimelineType.FlipY):
         bone_idx = r.read_u32()
         frame_count = r.read_u32()
+        saved_pos = r.pos
         times = read_f32_array(r, frame_count)
+        if frame_count > 1 and all(t < 1e-6 for t in times):
+            # Times are denormalized floats (actually u32 slot indices) — this
+            # "flip" entry is really draw-order trailing data misidentified as
+            # a timeline.  Roll back past bone_idx, frame_count, AND the type
+            # u32 that the caller already consumed (12 bytes total).
+            r.reset_pos(saved_pos - 12)
+            return False
         values = [r.read_byte() for _ in range(frame_count)]
         is_flip_x = (tl_type_v2 == V2TimelineType.FlipX)
         flip_key = "flipX" if is_flip_x else "flipY"
@@ -1772,8 +1790,8 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
             })
 
     elif tl_type_v2 == V2TimelineType.Event:
-        _param1 = r.read_u32()
-        _param2 = r.read_u32()
+        _effect_bone_idx = r.read_u32()  # bone index for effect spawn position (engine-only)
+        _reserved = r.read_u32()  # always 0
         raw_count = r.read_u32()
         frame_count = raw_count // 2
         for fi in range(frame_count):
@@ -1798,35 +1816,103 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
     return True
 
 
-def _find_trailing_draworder_array(
-    data: bytes, boundary: int, slot_count: int
-) -> Optional[List[int]]:
-    """Find the last valid LE u32 draw order permutation array before boundary.
+def _extract_draworder_arrays(
+    data: bytes,
+    boundary: int,
+    slot_count: int,
+    parser_end: int,
+    anim_start: int = 0,
+) -> List[List[int]]:
+    """Extract precomputed draw-order permutation arrays from an animation.
 
-    The SCSP format appends precomputed draw order arrays after the timeline
-    entries.  Due to minor byte-alignment drift in timeline parsing, the array
-    may start up to a few bytes before or after the naïve ``boundary -
-    array_size`` position, so we probe several nearby offsets.
+    Uses two strategies in order:
+
+    1. **Forward-remaining** (primary): after the timeline parser finishes at
+       *parser_end*, the remaining bytes ``boundary - parser_end`` should equal
+       ``N * array_size``.  ``N`` is determined by integer division.  The actual
+       block of ``[0x01][array]`` units is then located by trying small trailing
+       offsets (0-3 bytes) from *boundary*.
+
+    2. **Backward scan** (fallback): scans backward from *boundary* (with
+       offsets 0-3) looking for contiguous ``[0x01][array]`` units.  Handles
+       edge cases where strategy 1 fails (e.g. parser stopped early).
     """
+    if slot_count <= 0:
+        return []
+
     array_size = slot_count * 4
-    base = boundary - array_size
-    for delta in range(5):
-        for sign in (0, -1, 1):
-            pos = base + sign * delta
-            if pos < 0:
-                continue
+    unit_size = array_size + 1
+    target = list(range(slot_count))
+
+    def _read_block_at(block_start: int, n: int) -> Optional[List[List[int]]]:
+        """Read *n* units of ``[0x01][array]`` starting at *block_start*."""
+        if block_start < anim_start:
+            return None
+        arrays: List[List[int]] = []
+        for i in range(n):
+            sep_pos = block_start + i * unit_size
+            if sep_pos >= len(data) or data[sep_pos] != 0x01:
+                return None
+            arr_pos = sep_pos + 1
+            if arr_pos + array_size > len(data):
+                return None
             try:
                 arr = [
-                    struct.unpack_from("<I", data, pos + i * 4)[0]
-                    for i in range(slot_count)
+                    struct.unpack_from("<I", data, arr_pos + j * 4)[0]
+                    for j in range(slot_count)
                 ]
             except struct.error:
-                continue
-            if all(0 <= v < slot_count for v in arr) and sorted(arr) == list(
-                range(slot_count)
-            ):
-                return arr
-    return None
+                return None
+            if not (all(0 <= v < slot_count for v in arr) and sorted(arr) == target):
+                return None
+            arrays.append(arr)
+        return arrays
+
+    remaining = boundary - parser_end
+    if remaining > 0 and remaining % array_size == 0:
+        n_expected = remaining // array_size
+        if n_expected > 0:
+            for gap in range(4):
+                block_start = boundary - gap - n_expected * unit_size
+                result = _read_block_at(block_start, n_expected)
+                if result is not None:
+                    return result
+
+    # Fallback: backward scan with multiple offsets
+    for gap in range(4):
+        arrays = _backward_scan_block(data, boundary - gap, slot_count, anim_start)
+        if arrays:
+            return arrays
+
+    return []
+
+
+def _backward_scan_block(
+    data: bytes, end: int, slot_count: int, anim_start: int
+) -> List[List[int]]:
+    """Scan backward from *end* for contiguous ``[0x01][array]`` units."""
+    array_size = slot_count * 4
+    target = list(range(slot_count))
+    arrays: List[List[int]] = []
+
+    pos = end - array_size
+    while pos > anim_start:
+        try:
+            arr = [
+                struct.unpack_from("<I", data, pos + i * 4)[0]
+                for i in range(slot_count)
+            ]
+        except struct.error:
+            break
+        if not (all(0 <= v < slot_count for v in arr) and sorted(arr) == target):
+            break
+        if pos - 1 < anim_start or data[pos - 1] != 0x01:
+            break
+        arrays.append(arr)
+        pos = pos - 1 - array_size
+
+    arrays.reverse()
+    return arrays
 
 
 def _reverse_spine_offsets(
@@ -1889,9 +1975,12 @@ def _reverse_spine_offsets(
 def _merge_v2_draworder(anim: 'AnimationData', sk: 'SkeletonData') -> None:
     """Build the drawOrder timeline for a V2 animation.
 
-    Uses the precomputed trailing draw-order array (if available) as the
-    authoritative slot ordering, falling back to the per-slot type-9 entries
-    for keyframe timing.
+    Strategy — activation-state-based mapping:
+    1. Compute per-keyframe activation states from type-9 entries.
+    2. When precomputed arrays exist (N > 0), deduplicate them preserving
+       block order and map each unique activation state to the next unused
+       unique array in chronological order.
+    3. When N == 0, fall back to per-slot type-9 entries with ``offset=1``.
     """
     raw = anim._v2_draworder_raw
     if not raw:
@@ -1904,24 +1993,71 @@ def _merge_v2_draworder(anim: 'AnimationData', sk: 'SkeletonData') -> None:
     sorted_times = sorted(all_times)
 
     slot_count = len(sk.slots)
+    trailing_arrays: List[List[int]] = anim._v2_trailing_arrays
 
-    # --- Try to use precomputed trailing array ---
-    base_offsets = getattr(anim, '_v2_trailing_offsets', None)
+    if trailing_arrays:
+        slot_frames: Dict[int, List[Tuple[float, bool]]] = {}
+        for entry in raw:
+            slot_frames[entry['slot_idx']] = entry['frames']
 
-    if base_offsets is not None:
-        offset_list = [
-            {"slot": sk.slots[s].name, "offset": o}
-            for s, o in base_offsets
-            if 0 <= s < slot_count
-        ]
+        def _activation_state_at(t: float) -> frozenset:
+            active: set = set()
+            for slot_idx, frames in slot_frames.items():
+                a = False
+                for ft, fa in frames:
+                    if ft <= t:
+                        a = fa
+                    else:
+                        break
+                if a:
+                    active.add(slot_idx)
+            return frozenset(active)
+
+        unique_arrays: List[List[int]] = []
+        for arr in trailing_arrays:
+            if arr not in unique_arrays:
+                unique_arrays.append(arr)
+
+        state_to_array: Dict[frozenset, List[int]] = {}
+        array_cursor = 0
+
         for t in sorted_times:
-            keyframe: Dict[str, Any] = {"time": t}
-            if offset_list:
-                keyframe["offsets"] = list(offset_list)
-            anim.drawOrder.append(keyframe)
-        return
+            state = _activation_state_at(t)
+            if state not in state_to_array:
+                if array_cursor < len(unique_arrays):
+                    state_to_array[state] = unique_arrays[array_cursor]
+                    array_cursor += 1
+                elif len(unique_arrays) == 1:
+                    state_to_array[state] = unique_arrays[0]
+                else:
+                    state_to_array[state] = unique_arrays[-1]
 
-    # --- Fallback: original per-slot logic ---
+        all_ok = True
+        offset_cache: Dict[int, List[Dict[str, Any]]] = {}
+        for arr_id, arr in enumerate(unique_arrays):
+            if id(arr) not in offset_cache:
+                spine_offsets = _reverse_spine_offsets(arr, slot_count)
+                if spine_offsets is None:
+                    all_ok = False
+                    break
+                offset_cache[id(arr)] = [
+                    {"slot": sk.slots[s].name, "offset": o}
+                    for s, o in spine_offsets
+                    if 0 <= s < slot_count
+                ]
+
+        if all_ok:
+            for t in sorted_times:
+                state = _activation_state_at(t)
+                arr = state_to_array[state]
+                offset_list = offset_cache[id(arr)]
+                keyframe: Dict[str, Any] = {"time": t}
+                if offset_list:
+                    keyframe["offsets"] = list(offset_list)
+                anim.drawOrder.append(keyframe)
+            return
+
+    # Fallback: per-slot type-9 logic (used when N=0 or offset conversion fails)
     slot_state: Dict[int, Dict] = {}
     for entry in raw:
         slot_state[entry['slot_idx']] = {
@@ -1942,14 +2078,24 @@ def _merge_v2_draworder(anim: 'AnimationData', sk: 'SkeletonData') -> None:
             if active and info['offset'] != 0:
                 slot_name = sk.slots[slot_idx].name
                 offsets.append({"slot": slot_name, "offset": info['offset']})
-        keyframe_fb: Dict[str, Any] = {"time": t}
+        keyframe: Dict[str, Any] = {"time": t}
         if offsets:
-            keyframe_fb["offsets"] = offsets
-        anim.drawOrder.append(keyframe_fb)
+            keyframe["offsets"] = offsets
+        anim.drawOrder.append(keyframe)
 
 
 def _collect_anim_name_offsets(sk: SkeletonData) -> Set[int]:
-    """Collect string pool offsets for animation names by excluding known names."""
+    """Collect string pool offsets for animation names by excluding known names.
+
+    Primary filter: string-text exclusion (any pool entry whose text
+    matches a bone/slot/skin/attachment/event name is excluded).
+
+    Collision fix: a structural entity name (bone/slot/IK/skin/event)
+    may share its text with an animation (e.g. both a bone and an
+    animation called ``down``).  We detect this when a name appears at
+    exactly two pool offsets — one consumed by the entity parser, one
+    not — and add the unused offset back as an animation candidate.
+    """
     known_names: Set[str] = set()
     for b in sk.bones:
         known_names.add(b.name)
@@ -1977,17 +2123,45 @@ def _collect_anim_name_offsets(sk: SkeletonData) -> Set[int]:
         known_names.add(sk.version)
         known_names.add(sk.version + ".scsp")
 
-    anim_offsets: Set[int] = set()
     pool = sk.stringPool
+    used_offsets = sk._v2_used_pool_offsets
+
+    name_to_offsets: Dict[str, List[int]] = defaultdict(list)
+    anim_offsets: Set[int] = set()
     i = 0
     while i < len(pool):
         end = pool.find(b'\x00', i)
         if end == -1:
             end = len(pool)
         name = pool[i:end].decode('utf-8', errors='replace')
-        if name and name not in known_names and len(name) >= 2:
-            anim_offsets.add(i)
+        if name and len(name) >= 2:
+            if name not in known_names:
+                anim_offsets.add(i)
+            else:
+                name_to_offsets[name].append(i)
         i = end + 1
+
+    structural_names: Set[str] = set()
+    for b in sk.bones:
+        structural_names.add(b.name)
+    for sl in sk.slots:
+        structural_names.add(sl.name)
+    for ik in sk.ikConstraints:
+        structural_names.add(ik.name)
+    for skin in sk.skins:
+        structural_names.add(skin.name)
+    for ev in sk.events:
+        structural_names.add(ev.name)
+
+    for name in structural_names:
+        offsets = name_to_offsets.get(name)
+        if not offsets or len(offsets) != 2:
+            continue
+        entity = [o for o in offsets if o in used_offsets]
+        candidate = [o for o in offsets if o not in used_offsets]
+        if len(entity) == 1 and len(candidate) == 1:
+            anim_offsets.add(candidate[0])
+
     return anim_offsets
 
 
@@ -2036,6 +2210,8 @@ def read_animations_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
             f"expected {sk.v2_anim_count}"
         )
 
+    slot_count = len(sk.slots)
+
     for ai in range(len(header_positions)):
         r.reset_pos(header_positions[ai])
         anim = AnimationData()
@@ -2063,16 +2239,16 @@ def read_animations_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
             if not _parse_ok:
                 break
 
-        # Extract draw order from precomputed trailing array if present
-        slot_count = len(sk.slots)
-        if slot_count > 0 and anim._v2_draworder_raw:
-            trailing_arr = _find_trailing_draworder_array(
-                r.data, boundary, slot_count
+        # Extract draw-order arrays AFTER parsing timelines.
+        # The parser naturally over-reads N+gap bytes into the block (due to
+        # the phantom FlipY entry), so remaining = boundary - r.pos == N*arr_sz.
+        if slot_count > 0:
+            trailing_arrays = _extract_draworder_arrays(
+                r.data, boundary, slot_count,
+                parser_end=r.pos, anim_start=header_positions[ai],
             )
-            if trailing_arr is not None:
-                spine_offsets = _reverse_spine_offsets(trailing_arr, slot_count)
-                if spine_offsets:
-                    anim._v2_trailing_offsets = spine_offsets
+            if trailing_arrays:
+                anim._v2_trailing_arrays = trailing_arrays
 
         _merge_v2_draworder(anim, sk)
         animations.append(anim)
