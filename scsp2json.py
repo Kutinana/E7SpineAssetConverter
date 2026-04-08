@@ -1337,12 +1337,15 @@ def read_skins_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
                 att.scaleX = r.read_f32()
                 att.scaleY = r.read_f32()
                 att.rotation = r.read_f32()
-                r.skip(8)
+                orig_width = r.read_f32()
+                orig_height = r.read_f32()
                 att.color = f32_color(r.read_f32(), r.read_f32(), r.read_f32(), r.read_f32())
                 r.skip(8)
-                att.width = float(r.read_u32())
-                att.height = float(r.read_u32())
+                _atlas_width = r.read_u32()
+                _atlas_height = r.read_u32()
                 r.skip(72)
+                att.width = orig_width
+                att.height = orig_height
                 att.name = item_name
                 att.path = item_path
                 att.type = AttachmentType.Region
@@ -1407,6 +1410,23 @@ def read_skins_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
 
     sk.skins = skins
     sk.v2_skin_records = skin_records
+
+def _normalize_rotation_angles(entries: List[Dict]) -> None:
+    """Normalize rotation angles so consecutive-frame differences stay within [-180, 180].
+
+    Spine runtimes wrap internally, but many viewers do naive linear
+    interpolation, causing visual glitches when raw angles jump by >180°.
+    """
+    for i in range(1, len(entries)):
+        prev = entries[i - 1].get('angle', 0)
+        cur = entries[i].get('angle', 0)
+        diff = cur - prev
+        while diff > 180:
+            diff -= 360
+        while diff < -180:
+            diff += 360
+        entries[i]['angle'] = round(prev + diff, 4)
+
 
 def _read_v2_curves(r: SpineBinaryReader, frame_count: int) -> List[Dict]:
     """Read V2-style curve data. Returns list of curve dicts for each frame transition."""
@@ -1594,6 +1614,7 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
         for ci, cv in enumerate(curves):
             if cv:
                 entries[ci].update(cv)
+        _normalize_rotation_angles(entries)
         bone_name = sk.bones[bone_idx].name if 0 <= bone_idx < len(sk.bones) else ""
         anim.bones.setdefault(bone_name, {})["rotate"] = entries
 
@@ -1718,11 +1739,19 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
     elif tl_type_v2 in (V2TimelineType.FlipX, V2TimelineType.FlipY):
         bone_idx = r.read_u32()
         frame_count = r.read_u32()
-        # Separated layout: contiguous f32 times, then contiguous byte values.
-        # Spine 2.1 flip feature is unsupported by the official runtime/viewer,
-        # so we consume the bytes for alignment but do NOT output to JSON.
-        r.skip(frame_count * 4)  # times
-        r.skip(frame_count)      # values
+        times = read_f32_array(r, frame_count)
+        values = [r.read_byte() for _ in range(frame_count)]
+        is_flip_x = (tl_type_v2 == V2TimelineType.FlipX)
+        flip_key = "flipX" if is_flip_x else "flipY"
+        val_key = "x" if is_flip_x else "y"
+        entries = []
+        for fi in range(frame_count):
+            entry: Dict[str, Any] = {"time": round(times[fi], 4)}
+            entry[val_key] = bool(values[fi])
+            entries.append(entry)
+            anim.duration = max(anim.duration, times[fi])
+        bone_name = sk.bones[bone_idx].name if 0 <= bone_idx < len(sk.bones) else ""
+        anim.bones.setdefault(bone_name, {})[flip_key] = entries
 
     elif tl_type_v2 == V2TimelineType.DrawOrder:
         slot_idx = r.read_u32()
