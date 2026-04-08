@@ -1262,7 +1262,7 @@ def read_slots_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
         slot.name = get_pool_string(name_off, sk)
         slot.bone = sk.bones[bone_idx].name if 0 <= bone_idx < len(sk.bones) else None
         slot.color = f32_color(cr, cg, cb, ca)
-        slot.attachmentName = get_pool_string(att_off, sk) if att_off < 0xFFFF else None
+        slot.attachmentName = get_pool_string(att_off, sk) if att_off != 0xFFFFFFFF else None
         slot.blendMode = BlendMode(blend) if blend <= 3 else BlendMode.Normal
         slots.append(slot)
     sk.slots = slots
@@ -1644,8 +1644,8 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
         entries = []
         for fi in range(frame_count):
             entry: Dict[str, Any] = {"time": round(times[fi], 4)}
-            name = get_pool_string(name_offs[fi], sk) if name_offs[fi] < 0xFFFF else None
-            entry["name"] = name if name else None
+            name = get_pool_string(name_offs[fi], sk) if name_offs[fi] != 0xFFFFFFFF else None
+            entry["name"] = name
             entries.append(entry)
             anim.duration = max(anim.duration, times[fi])
         slot_name = sk.slots[slot_idx].name if 0 <= slot_idx < len(sk.slots) else ""
@@ -1745,8 +1745,23 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
     elif tl_type_v2 == V2TimelineType.Event:
         _param1 = r.read_u32()
         _param2 = r.read_u32()
-        count = r.read_u32()
-        r.skip(count * 4)
+        raw_count = r.read_u32()
+        frame_count = raw_count // 2
+        for fi in range(frame_count):
+            t = r.read_f32()
+            event_idx = int(r.read_f32())
+            entry: Dict[str, Any] = {"time": round(t, 4)}
+            if 0 <= event_idx < len(sk.events):
+                entry["name"] = sk.events[event_idx].name
+                ev = sk.events[event_idx]
+                if ev.intValue != 0:
+                    entry["int"] = ev.intValue
+                if ev.floatValue != 0.0:
+                    entry["float"] = ev.floatValue
+                if ev.stringValue:
+                    entry["string"] = ev.stringValue
+            anim.events.append(entry)
+            anim.duration = max(anim.duration, t)
 
     else:
         return False
@@ -1754,8 +1769,101 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
     return True
 
 
+def _find_trailing_draworder_array(
+    data: bytes, boundary: int, slot_count: int
+) -> Optional[List[int]]:
+    """Find the last valid LE u32 draw order permutation array before boundary.
+
+    The SCSP format appends precomputed draw order arrays after the timeline
+    entries.  Due to minor byte-alignment drift in timeline parsing, the array
+    may start up to a few bytes before or after the naïve ``boundary -
+    array_size`` position, so we probe several nearby offsets.
+    """
+    array_size = slot_count * 4
+    base = boundary - array_size
+    for delta in range(5):
+        for sign in (0, -1, 1):
+            pos = base + sign * delta
+            if pos < 0:
+                continue
+            try:
+                arr = [
+                    struct.unpack_from("<I", data, pos + i * 4)[0]
+                    for i in range(slot_count)
+                ]
+            except struct.error:
+                continue
+            if all(0 <= v < slot_count for v in arr) and sorted(arr) == list(
+                range(slot_count)
+            ):
+                return arr
+    return None
+
+
+def _reverse_spine_offsets(
+    draw_order: List[int], slot_count: int
+) -> Optional[List[Tuple[int, int]]]:
+    """Reverse-engineer Spine-style (slot_index, offset) pairs from a
+    precomputed draw-order permutation array.
+
+    Returns a sorted list of ``(slot_index, offset)`` tuples, or ``None`` on
+    failure.
+    """
+    position_of = {slot_idx: pos for pos, slot_idx in enumerate(draw_order)}
+    offset_slots: set = set()
+
+    for _ in range(slot_count):
+        unchanged = [s for s in range(slot_count) if s not in offset_slots]
+        occupied = {position_of[s]: s for s in offset_slots}
+        result = [-1] * slot_count
+        for p, s in occupied.items():
+            result[p] = s
+        ui = 0
+        for p in range(slot_count):
+            if result[p] == -1:
+                if ui < len(unchanged):
+                    result[p] = unchanged[ui]
+                    ui += 1
+        if result == list(draw_order):
+            break
+        new_found = False
+        for p in range(slot_count):
+            if result[p] != draw_order[p]:
+                s = draw_order[p]
+                if s not in offset_slots:
+                    offset_slots.add(s)
+                    new_found = True
+        if not new_found:
+            break
+
+    offsets = [(s, position_of[s] - s) for s in sorted(offset_slots)]
+
+    # Verify by forward simulation
+    check = [-1] * slot_count
+    for s, o in offsets:
+        idx = s + o
+        if not (0 <= idx < slot_count):
+            return None
+        check[idx] = s
+    unchanged = [s for s in range(slot_count) if s not in offset_slots]
+    ui = 0
+    for i in range(slot_count):
+        if check[i] == -1:
+            check[i] = unchanged[ui]
+            ui += 1
+    if check != list(draw_order):
+        return None
+
+    return offsets
+
+
 def _merge_v2_draworder(anim: 'AnimationData', sk: 'SkeletonData') -> None:
-    """Merge per-slot DrawOrder entries into a unified drawOrder timeline."""
+    """Build the drawOrder timeline for a V2 animation.
+
+    Uses the precomputed trailing draw-order array (if available) as the
+    authoritative slot ordering, falling back to the per-slot type-9 entries
+    for keyframe timing.
+    """
     raw = anim._v2_draworder_raw
     if not raw:
         return
@@ -1766,6 +1874,25 @@ def _merge_v2_draworder(anim: 'AnimationData', sk: 'SkeletonData') -> None:
             all_times.add(t)
     sorted_times = sorted(all_times)
 
+    slot_count = len(sk.slots)
+
+    # --- Try to use precomputed trailing array ---
+    base_offsets = getattr(anim, '_v2_trailing_offsets', None)
+
+    if base_offsets is not None:
+        offset_list = [
+            {"slot": sk.slots[s].name, "offset": o}
+            for s, o in base_offsets
+            if 0 <= s < slot_count
+        ]
+        for t in sorted_times:
+            keyframe: Dict[str, Any] = {"time": t}
+            if offset_list:
+                keyframe["offsets"] = list(offset_list)
+            anim.drawOrder.append(keyframe)
+        return
+
+    # --- Fallback: original per-slot logic ---
     slot_state: Dict[int, Dict] = {}
     for entry in raw:
         slot_state[entry['slot_idx']] = {
@@ -1786,10 +1913,10 @@ def _merge_v2_draworder(anim: 'AnimationData', sk: 'SkeletonData') -> None:
             if active and info['offset'] != 0:
                 slot_name = sk.slots[slot_idx].name
                 offsets.append({"slot": slot_name, "offset": info['offset']})
-        keyframe: Dict[str, Any] = {"time": t}
+        keyframe_fb: Dict[str, Any] = {"time": t}
         if offsets:
-            keyframe["offsets"] = offsets
-        anim.drawOrder.append(keyframe)
+            keyframe_fb["offsets"] = offsets
+        anim.drawOrder.append(keyframe_fb)
 
 
 def _collect_anim_name_offsets(sk: SkeletonData) -> Set[int]:
@@ -1906,6 +2033,17 @@ def read_animations_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
                 break
             if not _parse_ok:
                 break
+
+        # Extract draw order from precomputed trailing array if present
+        slot_count = len(sk.slots)
+        if slot_count > 0 and anim._v2_draworder_raw:
+            trailing_arr = _find_trailing_draworder_array(
+                r.data, boundary, slot_count
+            )
+            if trailing_arr is not None:
+                spine_offsets = _reverse_spine_offsets(trailing_arr, slot_count)
+                if spine_offsets:
+                    anim._v2_trailing_offsets = spine_offsets
 
         _merge_v2_draworder(anim, sk)
         animations.append(anim)
@@ -2178,10 +2316,8 @@ def write_json_data(sk: SkeletonData) -> Dict[str, Any]:
             if b.scaleY != 1.0: obj["scaleY"] = round(b.scaleY, 5)
             if b.flipX: obj["flipX"] = True
             if b.flipY: obj["flipY"] = True
-            if not b.inheritScale:
-                obj["transform"] = "noScale"
-            if not b.inheritRotation:
-                obj["inheritRotation"] = False
+            if not b.inheritScale: obj["inheritScale"] = False
+            if not b.inheritRotation: obj["inheritRotation"] = False
         else:
             if b.length != 0.0: obj["length"] = b.length
             if b.x != 0.0: obj["x"] = b.x
@@ -2454,7 +2590,8 @@ def write_json_data(sk: SkeletonData) -> Dict[str, Any]:
                 if anim.deform: a_obj["deform"] = anim.deform
             if anim.ffd: a_obj["ffd"] = anim.ffd
             if anim.drawOrder: a_obj["drawOrder"] = anim.drawOrder
-            if anim.events: a_obj["events"] = anim.events
+            if anim.events:
+                a_obj["events"] = sorted(anim.events, key=lambda e: e.get("time", 0.0))
             anims[anim.name] = a_obj
         j["animations"] = anims
 
