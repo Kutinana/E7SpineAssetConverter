@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import locale
 import os
+import queue
 import re
 import sys
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import (
     END, DISABLED, NORMAL, WORD,
@@ -23,7 +24,7 @@ from tkinter import (
 from sct2png import convert_sct_to_png
 from scsp2json import convert_scsp_to_json
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 _MAX_WORKERS = min(os.cpu_count() or 4, 8)
 
 # ==============================
@@ -255,6 +256,64 @@ def _flash_window(hwnd: int) -> None:
 
 
 # ==============================
+# Batch worker (top-level for ProcessPoolExecutor)
+# ==============================
+def _worker_convert_group(
+    stem: str,
+    sct_path: str,
+    scsp_path: str,
+    atlas_path: str,
+    dest: str,
+    fix_pma: bool,
+) -> tuple[int, int, list[str], list[str]]:
+    """Convert one group of files in a worker process.
+
+    Returns ``(ok_count, total_count, failures, log_lines)``.
+    """
+    Path(dest).mkdir(parents=True, exist_ok=True)
+    log_buf: list[str] = [f"━━ {stem} ━━"]
+    failures: list[str] = []
+    ok = 0
+    total = 0
+
+    for kind, path in [("SCT", sct_path), ("SCSP", scsp_path), ("ATLAS", atlas_path)]:
+        if not path:
+            continue
+        total += 1
+        name = Path(path).name
+        tag = f"  [{kind}]".ljust(10)
+        try:
+            if kind == "SCT":
+                out = (Path(dest) / Path(path).with_suffix(".png").name).as_posix()
+                success = convert_sct_to_png(path, out)
+            elif kind == "SCSP":
+                out = (Path(dest) / Path(path).with_suffix(".json").name).as_posix()
+                success = convert_scsp_to_json(path, out)
+            else:
+                out = (Path(dest) / name).as_posix()
+                fix_atlas_sct_ref(path, out)
+                if fix_pma:
+                    from fix_atlas import fix_atlas
+                    fix_atlas(out, out)
+                success = True
+
+            if success:
+                log_buf.append(f"{tag}{name}")
+                log_buf.append(f"          → {out}")
+                ok += 1
+            else:
+                log_buf.append(f"{tag}{name}")
+                log_buf.append(f"          FAIL")
+                failures.append(path)
+        except Exception as e:
+            log_buf.append(f"{tag}{name}")
+            log_buf.append(f"          FAIL: {e}")
+            failures.append(path)
+
+    return ok, total, failures, log_buf
+
+
+# ==============================
 # GUI
 # ==============================
 class App:
@@ -277,6 +336,9 @@ class App:
         self._widgets: dict[str, object] = {}
         self._cancel_event = threading.Event()
         self._tb: TaskbarProgress | None = None
+        self._log_queue: queue.Queue[str] = queue.Queue()
+        self._progress_queue: queue.Queue[tuple[int, int]] = queue.Queue()
+        self._poll_id: str | None = None
 
         self._build_ui()
         self._center_window()
@@ -503,18 +565,59 @@ class App:
     def _browse_out_dir(self) -> None:
         self._browse_dir(self.out_dir)
 
+    _LOG_MAX_LINES = 5000
+    _POLL_MS = 80
+
     def _log(self, msg: str, tag: str = "") -> None:
+        """Append a message to the log. Safe to call from any thread."""
+        self._log_queue.put(msg)
+
+    def _log_lines(self, lines: list[str]) -> None:
+        for line in lines:
+            self._log_queue.put(line)
+
+    def _start_poll(self) -> None:
+        if self._poll_id is None:
+            self._poll_id = self.root.after(self._POLL_MS, self._poll_queues)
+
+    def _stop_poll(self) -> None:
+        if self._poll_id is not None:
+            self.root.after_cancel(self._poll_id)
+            self._poll_id = None
+        self._flush_log()
+        self._flush_progress()
+
+    def _poll_queues(self) -> None:
+        self._flush_log()
+        self._flush_progress()
+        self._poll_id = self.root.after(self._POLL_MS, self._poll_queues)
+
+    def _flush_log(self) -> None:
+        msgs: list[str] = []
+        try:
+            while True:
+                msgs.append(self._log_queue.get_nowait())
+        except queue.Empty:
+            pass
+        if not msgs:
+            return
         self.log_text.configure(state=NORMAL)
-        self.log_text.insert(END, msg + "\n", tag)
+        self.log_text.insert(END, "\n".join(msgs) + "\n")
+        line_count = int(self.log_text.index("end-1c").split(".")[0])
+        if line_count > self._LOG_MAX_LINES:
+            self.log_text.delete("1.0", f"{line_count - self._LOG_MAX_LINES}.0")
         self.log_text.see(END)
         self.log_text.configure(state=DISABLED)
 
-    def _log_lines(self, lines: list[str]) -> None:
-        self.log_text.configure(state=NORMAL)
-        for line in lines:
-            self.log_text.insert(END, line + "\n")
-        self.log_text.see(END)
-        self.log_text.configure(state=DISABLED)
+    def _flush_progress(self) -> None:
+        latest: tuple[int, int] | None = None
+        try:
+            while True:
+                latest = self._progress_queue.get_nowait()
+        except queue.Empty:
+            pass
+        if latest is not None:
+            self._tb_progress_direct(*latest)
 
     def _set_buttons(self, state: str) -> None:
         self.convert_btn.configure(state=state)
@@ -542,6 +645,10 @@ class App:
             pass
 
     def _tb_progress(self, current: int, total: int) -> None:
+        """Enqueue a progress update. Safe to call from any thread."""
+        self._progress_queue.put((current, total))
+
+    def _tb_progress_direct(self, current: int, total: int) -> None:
         if self._tb:
             self._tb.set_progress(current, total)
 
@@ -600,7 +707,7 @@ class App:
                 with _lock:
                     log_lines.append(msg)
             else:
-                self.root.after(0, self._log, msg)
+                self._log(msg)
 
         def _do_sct() -> None:
             if self._cancel_event.is_set():
@@ -687,10 +794,10 @@ class App:
         if not failures:
             return
         t = self.i.t
-        self.root.after(0, self._log, t("fail_summary_header", n=len(failures)))
+        self._log(t("fail_summary_header", n=len(failures)))
         for f in failures:
-            self.root.after(0, self._log, f"  • {f}")
-        self.root.after(0, self._log, "")
+            self._log(f"  • {f}")
+        self._log("")
 
     def _do_convert(self, sct: str, scsp: str, atlas: str, out_dir: str) -> None:
         t0 = time.perf_counter()
@@ -702,23 +809,25 @@ class App:
             with done_lock:
                 done[0] += 1
                 c = done[0]
-            self.root.after(0, self._tb_progress, c, file_count)
+            self._tb_progress(c, file_count)
 
-        self.root.after(0, self._tb_progress, 0, file_count)
+        self._tb_progress(0, file_count)
+        self.root.after(0, self._start_poll)
         try:
             Path(out_dir).mkdir(parents=True, exist_ok=True)
             failures: list[str] = []
             ok, total = self._convert_one_group(sct, scsp, atlas, out_dir, failures, on_file_done)
             elapsed = self._fmt_elapsed(time.perf_counter() - t0)
             if self._cancel_event.is_set():
-                self.root.after(0, self._log, "\n" + self.i.t("cancelled"))
+                self._log("\n" + self.i.t("cancelled"))
                 self.root.after(0, self._tb_clear)
             else:
-                self.root.after(0, self._log, "\n" + self.i.t("done_single", ok=ok, total=total))
+                self._log("\n" + self.i.t("done_single", ok=ok, total=total))
                 self._log_failure_summary(failures)
                 self.root.after(0, self._tb_complete)
-            self.root.after(0, self._log, self.i.t("elapsed", t=elapsed) + "\n")
+            self._log(self.i.t("elapsed", t=elapsed) + "\n")
         finally:
+            self.root.after(0, self._stop_poll)
             self.root.after(0, self._set_buttons, NORMAL)
 
     # ---- batch convert ----
@@ -744,68 +853,52 @@ class App:
 
     def _do_batch(self, in_dir: str, out_dir: str, recursive: bool) -> None:
         t0 = time.perf_counter()
+        self.root.after(0, self._start_poll)
         try:
             groups = scan_folder_groups(in_dir, recursive)
             if not groups:
-                self.root.after(0, self._log, self.i.t("batch_none") + "\n")
+                self._log(self.i.t("batch_none") + "\n")
                 return
 
-            self.root.after(0, self._log, self.i.t("batch_scan", n=len(groups)) + "\n")
+            self._log(self.i.t("batch_scan", n=len(groups)) + "\n")
 
             all_file_count = sum(len(fm) for fm in groups.values())
-            _done = [0]
-            _done_lock = threading.Lock()
-
-            def on_file_done():
-                with _done_lock:
-                    _done[0] += 1
-                    c = _done[0]
-                self.root.after(0, self._tb_progress, c, all_file_count)
-
-            self.root.after(0, self._tb_progress, 0, all_file_count)
-
+            files_done = 0
             total_ok = 0
             total_files = 0
             group_ok = 0
             all_failures: list[str] = []
+            fix_pma = self.fix_atlas_pma.get()
 
-            def _process_group(stem: str, file_map: dict) -> tuple[int, int, list[str], list[str]]:
-                if self._cancel_event.is_set():
-                    return 0, 0, [], []
+            self._tb_progress(0, all_file_count)
 
-                sct_p = file_map.get("sct")
-                scsp_p = file_map.get("scsp")
-                atlas_p = file_map.get("atlas")
-
-                first = sct_p or scsp_p or atlas_p
-                if recursive and first:
-                    rel = first.parent.relative_to(in_dir)
-                    dest = (Path(out_dir) / rel).as_posix()
-                else:
-                    dest = out_dir
-
-                Path(dest).mkdir(parents=True, exist_ok=True)
-
-                log_buf: list[str] = [f"━━ {stem} ━━"]
-                grp_failures: list[str] = []
-
-                ok, cnt = self._convert_one_group(
-                    sct_p.as_posix() if sct_p else "",
-                    scsp_p.as_posix() if scsp_p else "",
-                    atlas_p.as_posix() if atlas_p else "",
-                    dest,
-                    grp_failures,
-                    on_file_done,
-                    log_buf,
-                )
-                return ok, cnt, grp_failures, log_buf
-
-            with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-                future_map = {}
+            with ProcessPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+                future_map: dict = {}
                 for stem, file_map in groups.items():
                     if self._cancel_event.is_set():
                         break
-                    future_map[pool.submit(_process_group, stem, file_map)] = stem
+
+                    sct_p = file_map.get("sct")
+                    scsp_p = file_map.get("scsp")
+                    atlas_p = file_map.get("atlas")
+
+                    first = sct_p or scsp_p or atlas_p
+                    if recursive and first:
+                        rel = first.parent.relative_to(in_dir)
+                        dest = (Path(out_dir) / rel).as_posix()
+                    else:
+                        dest = out_dir
+
+                    fut = pool.submit(
+                        _worker_convert_group,
+                        stem,
+                        sct_p.as_posix() if sct_p else "",
+                        scsp_p.as_posix() if scsp_p else "",
+                        atlas_p.as_posix() if atlas_p else "",
+                        dest,
+                        fix_pma,
+                    )
+                    future_map[fut] = stem
 
                 for fut in as_completed(future_map):
                     if self._cancel_event.is_set():
@@ -814,29 +907,31 @@ class App:
                         break
                     try:
                         ok, cnt, grp_failures, log_buf = fut.result()
-                        self.root.after(0, self._log_lines, log_buf)
+                        self._log_lines(log_buf)
                         total_ok += ok
                         total_files += cnt
+                        files_done += cnt
                         if cnt > 0 and ok == cnt:
                             group_ok += 1
                         all_failures.extend(grp_failures)
+                        self._tb_progress(files_done, all_file_count)
                     except Exception:
                         traceback.print_exc()
 
             elapsed = self._fmt_elapsed(time.perf_counter() - t0)
             if self._cancel_event.is_set():
-                self.root.after(0, self._log, "\n" + self.i.t("cancelled"))
+                self._log("\n" + self.i.t("cancelled"))
                 self.root.after(0, self._tb_clear)
             else:
-                self.root.after(
-                    0, self._log,
+                self._log(
                     "\n" + self.i.t("batch_done", gok=group_ok, gtotal=len(groups),
                                     fok=total_ok, ftotal=total_files),
                 )
                 self._log_failure_summary(all_failures)
                 self.root.after(0, self._tb_complete)
-            self.root.after(0, self._log, self.i.t("elapsed", t=elapsed) + "\n")
+            self._log(self.i.t("elapsed", t=elapsed) + "\n")
         finally:
+            self.root.after(0, self._stop_poll)
             self.root.after(0, self._set_buttons, NORMAL)
 
     def run(self) -> None:
@@ -845,4 +940,6 @@ class App:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     App().run()
