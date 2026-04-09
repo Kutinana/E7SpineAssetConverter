@@ -294,6 +294,122 @@ def _normalize_rotation_angles(entries: List[Dict]) -> None:
         entries[i]['angle'] = round(prev + diff, 4)
 
 
+# ==============================
+# 180° rotation offset fix
+# ==============================
+_TOGGLE_THRESHOLD = 130
+_OFFSET_THRESHOLD = 120
+_COST_RATIO = 0.5
+_MAX_SEGMENTS = 16
+
+
+def _wrap_180(a: float) -> float:
+    a = a % 360
+    if a > 180:
+        a -= 360
+    return a
+
+
+def _flip_angle(a: float) -> float:
+    return a - 180 if a > 0 else a + 180
+
+
+def _fix_rotation_timeline(entries: List[Dict]) -> bool:
+    """Fix 180-degree offset artifacts in a single rotation timeline.
+
+    Some SCSP V2 rotation keyframes are stored with a ~180° offset from their
+    intended values.  This function detects and corrects such artifacts by:
+
+      1. Detecting "toggle points" (consecutive frames differing by >130°).
+      2. If no toggles exist but ALL frames are near ±180° (>150°), applying
+         a uniform 180° flip (handles constant-offset timelines).
+      3. For timelines with toggles: splitting into segments, identifying
+         offset-candidate segments (mean |wrap(angle)| > 120°), and picking
+         the flip combination that minimises total squared frame-to-frame
+         wrapped differences.
+      4. Safety: requiring >=50% cost reduction and max corrected diff < 130°.
+
+    Operates on *entries* in place.  Returns True if any correction was made.
+    """
+    if len(entries) < 2:
+        return False
+
+    angles = [e.get('angle', 0) for e in entries]
+
+    toggles: List[int] = []
+    for i in range(1, len(angles)):
+        wd = _wrap_180(angles[i] - angles[i - 1])
+        if abs(wd) > _TOGGLE_THRESHOLD:
+            toggles.append(i)
+
+    if not toggles:
+        UNIFORM_THRESHOLD = 150
+        if all(abs(_wrap_180(a)) > UNIFORM_THRESHOLD for a in angles):
+            for i, e in enumerate(entries):
+                e['angle'] = round(_flip_angle(angles[i]), 4)
+            return True
+        return False
+
+    bounds = [0] + toggles + [len(angles)]
+    segments = [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
+    n_seg = len(segments)
+
+    if n_seg > _MAX_SEGMENTS:
+        return False
+
+    is_candidate = []
+    for start, end in segments:
+        mean_abs_wrap = sum(abs(_wrap_180(angles[j]))
+                           for j in range(start, end)) / (end - start)
+        is_candidate.append(mean_abs_wrap > _OFFSET_THRESHOLD)
+
+    if not any(is_candidate):
+        return False
+
+    def _cost(cand: List[float]) -> float:
+        return sum(_wrap_180(cand[i] - cand[i - 1]) ** 2
+                   for i in range(1, len(cand)))
+
+    base_cost = _cost(angles)
+    best_cost = base_cost
+    best_mask = 0
+
+    for mask in range(1, 1 << n_seg):
+        if any((mask >> si) & 1 and not is_candidate[si]
+               for si in range(n_seg)):
+            continue
+        cand = list(angles)
+        for si, (start, end) in enumerate(segments):
+            if (mask >> si) & 1:
+                for j in range(start, end):
+                    cand[j] = _flip_angle(cand[j])
+        cost = _cost(cand)
+        if cost < best_cost:
+            best_cost = cost
+            best_mask = mask
+
+    if best_mask == 0:
+        return False
+
+    if base_cost > 0 and best_cost / base_cost > _COST_RATIO:
+        return False
+
+    corrected = list(angles)
+    for si, (start, end) in enumerate(segments):
+        if (best_mask >> si) & 1:
+            for j in range(start, end):
+                corrected[j] = round(_flip_angle(corrected[j]), 4)
+
+    max_wd = max(abs(_wrap_180(corrected[i] - corrected[i - 1]))
+                 for i in range(1, len(corrected)))
+    if max_wd > _TOGGLE_THRESHOLD:
+        return False
+
+    for i, e in enumerate(entries):
+        e['angle'] = corrected[i]
+    return True
+
+
 def _read_v2_curves(r: SpineBinaryReader, frame_count: int) -> List[Dict]:
     """Read V2-style curve data. Returns list of curve dicts for each frame transition."""
     curves: List[Dict] = []
@@ -365,6 +481,7 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
         for ci, cv in enumerate(curves):
             if cv:
                 entries[ci].update(cv)
+        _fix_rotation_timeline(entries)
         _normalize_rotation_angles(entries)
         bone_name = sk.bones[bone_idx].name if 0 <= bone_idx < len(sk.bones) else ""
         anim.bones.setdefault(bone_name, {})["rotate"] = entries
