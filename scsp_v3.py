@@ -120,6 +120,7 @@ def read_attachment_v3(r: SpineBinaryReader, sk: SkeletonData) -> Attachment:
         linked.parentMesh = get_pool_string(parent_off, sk)
         linked.skinIndex, linked.deform = skin_index, deform_flag
         linked.color, linked.width, linked.height = clr, floats6[2], floats6[3]
+        linked.path = mesh.path
         attachment = mesh if att_type == AttachmentType.Mesh else linked
 
     elif att_type == AttachmentType.Path:

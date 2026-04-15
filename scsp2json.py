@@ -408,6 +408,8 @@ def write_json_data(sk: SkeletonData) -> Dict[str, Any]:
                             if m.vertices: a_obj["vertexCount"] = m.vertexCount; a_obj["vertices"] = m.vertices
                         case LinkedMeshAttachment() as lm:
                             a_obj["width"] = lm.width; a_obj["height"] = lm.height
+                            lm_path = lm.path
+                            if lm_path and lm_path != att_name: a_obj["path"] = lm_path
                             if lm.color: a_obj["color"] = color_to_string(lm.color, True)
                             a_obj["parent"] = lm.parentMesh
                             if not lm.deform: a_obj["deform"] = False

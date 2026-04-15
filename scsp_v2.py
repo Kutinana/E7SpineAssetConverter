@@ -973,8 +973,15 @@ def _merge_v2_draworder(anim: AnimationData, sk: SkeletonData) -> None:
                 else:
                     break
             if active and info['offset'] != 0:
-                slot_name = sk.slots[slot_idx].name
-                offsets.append({"slot": slot_name, "offset": info['offset']})
+                clamped = info['offset']
+                target = slot_idx + clamped
+                if target >= slot_count:
+                    clamped = slot_count - 1 - slot_idx
+                elif target < 0:
+                    clamped = -slot_idx
+                if clamped != 0:
+                    slot_name = sk.slots[slot_idx].name
+                    offsets.append({"slot": slot_name, "offset": clamped})
         keyframe: Dict[str, Any] = {"time": t}
         if offsets:
             keyframe["offsets"] = offsets

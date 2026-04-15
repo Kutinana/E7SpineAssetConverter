@@ -24,7 +24,7 @@ from tkinter import (
 from sct2png import convert_sct_to_png
 from scsp2json import convert_scsp_to_json
 
-VERSION = "1.2.2b"
+VERSION = "1.2.3b"
 _MAX_WORKERS = min(os.cpu_count() or 4, 8)
 
 # ==============================
