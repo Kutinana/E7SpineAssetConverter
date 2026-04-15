@@ -288,10 +288,9 @@ def _normalize_rotation_angles(entries: List[Dict]) -> None:
         prev = entries[i - 1].get('angle', 0)
         cur = entries[i].get('angle', 0)
         diff = cur - prev
-        while diff > 180:
-            diff -= 360
-        while diff < -180:
-            diff += 360
+        if not math.isfinite(diff):
+            continue
+        diff = math.remainder(diff, 360)
         entries[i]['angle'] = round(prev + diff, 4)
 
 
@@ -454,12 +453,20 @@ def read_events_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
     sk.events = events
 
 
+_MAX_RAW_COUNT = 20000
+
 def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
                              anim: AnimationData, tl_type_v2: int) -> bool:
     """Parse a single V2 timeline entry. Returns True if parsed, False to break."""
     if tl_type_v2 == V2TimelineType.Scale:
         bone_idx = r.read_u32()
         raw_count = r.read_u32()
+        if raw_count > _MAX_RAW_COUNT:
+            logging.warning(
+                f"[{sk.source_path}] Scale raw_count {raw_count} exceeds limit "
+                f"in anim '{anim.name}' (pos {r.pos}), skipping timeline"
+            )
+            return False
         frame_count = raw_count // 3
         entries = []
         for fi in range(frame_count):
@@ -479,10 +486,23 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
     elif tl_type_v2 == V2TimelineType.Rotate:
         bone_idx = r.read_u32()
         raw_count = r.read_u32()
+        if raw_count > _MAX_RAW_COUNT:
+            logging.warning(
+                f"[{sk.source_path}] Rotate raw_count {raw_count} exceeds limit "
+                f"in anim '{anim.name}' (pos {r.pos}), skipping timeline"
+            )
+            return False
         frame_count = raw_count // 2
         entries = []
         for fi in range(frame_count):
             t, angle = r.read_f32(), r.read_f32()
+            if not math.isfinite(angle) or abs(angle) > 1e6:
+                bone_name_dbg = sk.bones[bone_idx].name if 0 <= bone_idx < len(sk.bones) else f"?{bone_idx}"
+                logging.warning(
+                    f"[{sk.source_path}] Extreme rotation angle {angle} "
+                    f"in anim '{anim.name}' bone '{bone_name_dbg}' "
+                    f"frame {fi}/{frame_count} (pos {r.pos}, raw_count {raw_count})"
+                )
             entry: Dict[str, Any] = {"time": round(t, 4), "angle": round(angle, 4)}
             entries.append(entry)
             anim.duration = max(anim.duration, t)
@@ -498,6 +518,12 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
     elif tl_type_v2 == V2TimelineType.Translate:
         bone_idx = r.read_u32()
         raw_count = r.read_u32()
+        if raw_count > _MAX_RAW_COUNT:
+            logging.warning(
+                f"[{sk.source_path}] Translate raw_count {raw_count} exceeds limit "
+                f"in anim '{anim.name}' (pos {r.pos}), skipping timeline"
+            )
+            return False
         frame_count = raw_count // 3
         entries = []
         for fi in range(frame_count):
@@ -517,6 +543,12 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
     elif tl_type_v2 == V2TimelineType.Color:
         slot_idx = r.read_u32()
         raw_count = r.read_u32()
+        if raw_count > _MAX_RAW_COUNT:
+            logging.warning(
+                f"[{sk.source_path}] Color raw_count {raw_count} exceeds limit "
+                f"in anim '{anim.name}' (pos {r.pos}), skipping timeline"
+            )
+            return False
         frame_count = raw_count // 5
         entries = []
         for fi in range(frame_count):
@@ -551,6 +583,12 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
 
     elif tl_type_v2 == V2TimelineType.FFD:
         frame_count = r.read_u32()
+        if frame_count > _MAX_RAW_COUNT:
+            logging.warning(
+                f"[{sk.source_path}] FFD frame_count {frame_count} exceeds limit "
+                f"in anim '{anim.name}' (pos {r.pos}), skipping timeline"
+            )
+            return False
         times = read_f32_array(r, frame_count)
         r.skip(4)
         verts_per_frame = r.read_u32()
@@ -595,6 +633,12 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
     elif tl_type_v2 == V2TimelineType.IkConstraint:
         ik_idx = r.read_u32()
         raw_count = r.read_u32()
+        if raw_count > _MAX_RAW_COUNT:
+            logging.warning(
+                f"[{sk.source_path}] IkConstraint raw_count {raw_count} exceeds limit "
+                f"in anim '{anim.name}' (pos {r.pos}), skipping timeline"
+            )
+            return False
         frame_count = raw_count // 3
         entries = []
         for fi in range(frame_count):
@@ -616,11 +660,13 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
     elif tl_type_v2 in (V2TimelineType.FlipX, V2TimelineType.FlipY):
         bone_idx = r.read_u32()
         frame_count = r.read_u32()
+        if frame_count > _MAX_RAW_COUNT:
+            logging.warning(
+                f"[{sk.source_path}] Flip frame_count {frame_count} exceeds limit "
+                f"in anim '{anim.name}' (pos {r.pos}), skipping timeline"
+            )
+            return False
 
-        # Sentinel FlipY: bone_idx == slot_count encodes draw-order timing.
-        # The N time values mark when each precomputed draw-order array should
-        # be applied; the "values" field does not exist — the next bytes are
-        # the [0x01][array] trailing block.
         if tl_type_v2 == V2TimelineType.FlipY and bone_idx == len(sk.slots):
             times = read_f32_array(r, frame_count)
             anim._v2_sentinel_times = [round(t, 4) for t in times]
@@ -648,6 +694,12 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
         slot_idx = r.read_u32()
         offset = r.read_u32()
         count = r.read_u32()
+        if count > _MAX_RAW_COUNT:
+            logging.warning(
+                f"[{sk.source_path}] DrawOrder count {count} exceeds limit "
+                f"in anim '{anim.name}' (pos {r.pos}), skipping timeline"
+            )
+            return False
         frame_count = count // 2
         frames = []
         for _ in range(frame_count):
@@ -663,9 +715,15 @@ def _parse_v2_timeline_entry(r: SpineBinaryReader, sk: SkeletonData,
             })
 
     elif tl_type_v2 == V2TimelineType.Event:
-        _effect_bone_idx = r.read_u32()  # bone index for effect spawn position (engine-only)
-        _reserved = r.read_u32()  # always 0
+        _effect_bone_idx = r.read_u32()
+        _reserved = r.read_u32()
         raw_count = r.read_u32()
+        if raw_count > _MAX_RAW_COUNT:
+            logging.warning(
+                f"[{sk.source_path}] Event raw_count {raw_count} exceeds limit "
+                f"in anim '{anim.name}' (pos {r.pos}), skipping timeline"
+            )
+            return False
         frame_count = raw_count // 2
         for fi in range(frame_count):
             t = r.read_f32()
@@ -1046,20 +1104,27 @@ def _collect_anim_name_offsets(sk: SkeletonData) -> Set[int]:
     pool = sk.stringPool
     used_offsets = sk._v2_used_pool_offsets
 
+    _MAX_POOL_DUPES = 4
+
     name_to_offsets: Dict[str, List[int]] = defaultdict(list)
-    anim_offsets: Set[int] = set()
+    unknown_name_offsets: Dict[str, List[int]] = defaultdict(list)
     i = 0
     while i < len(pool):
         end = pool.find(b'\x00', i)
         if end == -1:
             end = len(pool)
         name = pool[i:end].decode('utf-8', errors='replace')
-        if name and len(name) >= 2:
+        if name and len(name) >= 2 and '/' not in name:
             if name not in known_names:
-                anim_offsets.add(i)
+                unknown_name_offsets[name].append(i)
             else:
                 name_to_offsets[name].append(i)
         i = end + 1
+
+    anim_offsets: Set[int] = set()
+    for name, offsets in unknown_name_offsets.items():
+        if len(offsets) <= _MAX_POOL_DUPES:
+            anim_offsets.update(offsets)
 
     for name in structural_names:
         offsets = name_to_offsets.get(name)
@@ -1081,11 +1146,18 @@ def _prescan_v2_anim_headers(r: SpineBinaryReader, sk: SkeletonData,
     slot_count = len(sk.slots) if sk.slots else sk.v2_slot_count
     data = r.data
     headers: List[int] = []
-    seen_names: Set[int] = set()
+    seen_offsets: Set[int] = set()
+    seen_texts: Set[str] = set()
 
     for pos in range(anim_start, len(data) - 20):
         name_off = struct.unpack_from("<I", data, pos)[0]
-        if name_off not in anim_name_offsets or name_off in seen_names:
+        if name_off not in anim_name_offsets or name_off in seen_offsets:
+            continue
+        name_text = get_pool_string(name_off, sk)
+        if name_text in seen_texts:
+            continue
+        dur = struct.unpack_from("<f", data, pos + 4)[0]
+        if not math.isfinite(dur) or dur < 0 or dur > 3600:
             continue
         ec = struct.unpack_from("<I", data, pos + 8)[0]
         if ec < 1 or ec > 5000:
@@ -1098,7 +1170,8 @@ def _prescan_v2_anim_headers(r: SpineBinaryReader, sk: SkeletonData,
             continue
         if ft in (3, 4) and fi >= slot_count:
             continue
-        seen_names.add(name_off)
+        seen_offsets.add(name_off)
+        seen_texts.add(name_text)
         headers.append(pos)
 
     headers.sort()
@@ -1114,8 +1187,8 @@ def read_animations_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
 
     if len(header_positions) != sk.v2_anim_count:
         logging.warning(
-            f"Pre-scan found {len(header_positions)} animation headers, "
-            f"expected {sk.v2_anim_count}"
+            f"[{sk.source_path}] Pre-scan found {len(header_positions)} "
+            f"animation headers, expected {sk.v2_anim_count}"
         )
 
     slot_count = len(sk.slots)

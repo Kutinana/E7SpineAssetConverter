@@ -76,6 +76,15 @@ python fix_atlas.py input.atlas                  # fix in place
 python fix_atlas.py input.atlas output.atlas     # output to new file
 ```
 
+## Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| **Fix Atlas pma** | ✅ On | Remove the Spine 3.x `pma` field from atlas files, which causes errors in Spine 2.1 viewers. |
+| **Fix 180° rotation offset** | ✅ On | Correct V2 skeletal animations where some bone rotation keyframes are stored with a ~180° offset from their intended values. Without this fix, affected bones (e.g. limbs) may appear flipped or spin a full 360° during playback. Only applies to V2 (Spine 2.1.27) files. |
+
+Both options are available as checkboxes in the GUI and are enabled by default.
+
 ## Conversion Details
 
 | Input    | Output   | Description                                           |

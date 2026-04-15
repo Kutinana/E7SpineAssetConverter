@@ -7,6 +7,7 @@ Workflow: .sct + .scsp + .atlas  →  .png + .json + .atlas
 from __future__ import annotations
 
 import locale
+import logging
 import os
 import queue
 import re
@@ -14,7 +15,8 @@ import sys
 import threading
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import (
     END, DISABLED, NORMAL, WORD,
@@ -24,7 +26,7 @@ from tkinter import (
 from sct2png import convert_sct_to_png
 from scsp2json import convert_scsp_to_json
 
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 _MAX_WORKERS = min(os.cpu_count() or 4, 8)
 
 # ==============================
@@ -272,6 +274,7 @@ def _worker_convert_group(
 
     Returns ``(ok_count, total_count, failures, log_lines)``.
     """
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
     from scsp_v2 import set_rotation_fix_enabled
     set_rotation_fix_enabled(fix_rot)
     Path(dest).mkdir(parents=True, exist_ok=True)
@@ -884,9 +887,9 @@ class App:
 
             self._tb_progress(0, all_file_count)
 
-            pool = ProcessPoolExecutor(max_workers=_MAX_WORKERS)
+            pool = multiprocessing.Pool(processes=_MAX_WORKERS)
             try:
-                future_map: dict = {}
+                pending: list[tuple] = []
                 for stem, file_map in groups.items():
                     if self._cancel_event.is_set():
                         break
@@ -902,37 +905,45 @@ class App:
                     else:
                         dest = out_dir
 
-                    fut = pool.submit(
+                    ar = pool.apply_async(
                         _worker_convert_group,
-                        stem,
-                        sct_p.as_posix() if sct_p else "",
-                        scsp_p.as_posix() if scsp_p else "",
-                        atlas_p.as_posix() if atlas_p else "",
-                        dest,
-                        fix_pma,
-                        fix_rot,
+                        (stem,
+                         sct_p.as_posix() if sct_p else "",
+                         scsp_p.as_posix() if scsp_p else "",
+                         atlas_p.as_posix() if atlas_p else "",
+                         dest, fix_pma, fix_rot),
                     )
-                    future_map[fut] = stem
+                    pending.append((ar, len(file_map)))
 
-                for fut in as_completed(future_map):
+                pool.close()
+
+                while pending:
                     if self._cancel_event.is_set():
-                        for f in future_map:
-                            f.cancel()
                         break
-                    try:
-                        ok, cnt, grp_failures, log_buf = fut.result()
-                        self._log_lines(log_buf)
-                        total_ok += ok
-                        total_files += cnt
-                        files_done += cnt
-                        if cnt > 0 and ok == cnt:
-                            group_ok += 1
-                        all_failures.extend(grp_failures)
-                        self._tb_progress(files_done, all_file_count)
-                    except Exception:
-                        traceback.print_exc()
+                    still_pending = []
+                    for ar, exp_cnt in pending:
+                        if ar.ready():
+                            try:
+                                ok, cnt, grp_failures, log_buf = ar.get(timeout=1)
+                                self._log_lines(log_buf)
+                                total_ok += ok
+                                total_files += cnt
+                                files_done += cnt
+                                if cnt > 0 and ok == cnt:
+                                    group_ok += 1
+                                all_failures.extend(grp_failures)
+                            except Exception:
+                                files_done += exp_cnt
+                                traceback.print_exc()
+                            self._tb_progress(files_done, all_file_count)
+                        else:
+                            still_pending.append((ar, exp_cnt))
+                    pending = still_pending
+                    if pending:
+                        time.sleep(0.05)
             finally:
-                pool.shutdown(wait=False, cancel_futures=True)
+                pool.terminate()
+                pool.join()
 
             elapsed = self._fmt_elapsed(time.perf_counter() - t0)
             if self._cancel_event.is_set():
@@ -956,6 +967,9 @@ class App:
 
 
 if __name__ == "__main__":
-    import multiprocessing
     multiprocessing.freeze_support()
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(levelname)s: %(message)s",
+    )
     App().run()

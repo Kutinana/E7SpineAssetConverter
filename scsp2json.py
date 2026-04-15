@@ -12,6 +12,7 @@ This is the main entry point.  Parsing logic lives in:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -48,9 +49,10 @@ def read_skeleton_info(r: SpineBinaryReader, sk: SkeletonData) -> None:
     else:
         read_skeleton_info_v3(r, sk)
 
-def read_binary_skeleton(data: bytes) -> Tuple[SkeletonData, bool]:
+def read_binary_skeleton(data: bytes, source_path: str = "") -> Tuple[SkeletonData, bool]:
     r = SpineBinaryReader(data)
     sk = SkeletonData()
+    sk.source_path = source_path
     read_skeleton_info(r, sk)
     if sk.scspVersion == ScspVersion.V2:
         read_scsp_v2(r, sk)
@@ -499,9 +501,9 @@ def convert_scsp_to_json(input_path: str, output_path: str, compress: bool = Tru
         data = f.read()
 
     try:
-        skeleton, _ok = read_binary_skeleton(data)
+        skeleton, _ok = read_binary_skeleton(data, source_path=input_path)
     except Exception as e:
-        print(f"[ERROR] {input_path}: {e}")
+        logging.error(f"{input_path}: {e}")
         return False
 
     root = write_json_data(skeleton)
@@ -512,7 +514,7 @@ def convert_scsp_to_json(input_path: str, output_path: str, compress: bool = Tru
         f.write(json_str)
 
     ver_label = "V2 (2.1.27)" if skeleton.scspVersion == ScspVersion.V2 else "V3 (3.8.99)"
-    print(f"[OK] {input_path} → {output_path} ({ver_label})")
+    logging.debug(f"[OK] {input_path} → {output_path} ({ver_label})")
     return True
 
 
@@ -528,14 +530,18 @@ def batch_convert(input_dir: str, output_dir: str, compress: bool = True):
             if convert_scsp_to_json(str(f), str(of), compress):
                 success += 1
         except Exception as e:
-            print(f"[ERROR] {f}: {e}")
-    print(f"\nDone: {success}/{total} files converted.")
+            logging.error(f"{f}: {e}")
+    logging.info(f"Done: {success}/{total} files converted.")
 
 
 # ==============================
 # Entry
 # ==============================
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(levelname)s: %(message)s",
+    )
     if len(sys.argv) < 2:
         print("Usage: python scsp2json.py <input.scsp|input_dir> [output.json|output_dir]")
         sys.exit(1)

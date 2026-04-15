@@ -9,6 +9,7 @@ on the value 'true'/'false'. This script strips the pma line.
 Usage: python fix_atlas.py <input.atlas> [output.atlas]
 """
 
+import logging
 import sys
 import re
 import os
@@ -24,7 +25,7 @@ def fix_atlas(input_path: str, output_path: str) -> None:
         f.writelines(out_lines)
 
     removed = len(lines) - len(out_lines)
-    print(f"[OK] {input_path} -> {output_path} (removed {removed} pma line(s))")
+    logging.debug(f"[OK] {input_path} -> {output_path} (removed {removed} pma line(s))")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ Based on EpicSevenAssetRipper-2.0's sct.py hook.
 from __future__ import annotations
 
 import io
+import logging
 import struct
 from pathlib import Path
 
@@ -102,7 +103,7 @@ def convert_sct_to_png(input_path: str, output_path: str) -> bool:
     image = decode_sct(data)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path, "PNG")
-    print(f"[OK] {input_path} -> {output_path}")
+    logging.debug(f"[OK] {input_path} -> {output_path}")
     return True
 
 
