@@ -50,6 +50,7 @@ def read_skeleton_info_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
       [80]  bone data begins
     """
     has_magic = r.data[:4] == b"scsp"
+    sk.v2_has_magic = has_magic
 
     if has_magic:
         r.reset_pos(8)
@@ -136,7 +137,7 @@ def read_iks_v2(r: SpineBinaryReader, sk: SkeletonData) -> None:
     for _ in range(sk.v2_ik_count):
         ik = IKConstraintData()
         name_off = r.read_u32()
-        bone_count = r.read_u16()
+        bone_count = r.read_u32() if not sk.v2_has_magic else r.read_u16()
         bone_idxs = read_u16_array(r, bone_count)
         target_idx = r.read_u16()
         ik.mix = r.read_f32()
@@ -301,6 +302,12 @@ _TOGGLE_THRESHOLD = 130
 _OFFSET_THRESHOLD = 120
 _COST_RATIO = 0.5
 _MAX_SEGMENTS = 16
+_rotation_fix_enabled = True
+
+
+def set_rotation_fix_enabled(enabled: bool) -> None:
+    global _rotation_fix_enabled
+    _rotation_fix_enabled = enabled
 
 
 def _wrap_180(a: float) -> float:
@@ -331,6 +338,8 @@ def _fix_rotation_timeline(entries: List[Dict]) -> bool:
 
     Operates on *entries* in place.  Returns True if any correction was made.
     """
+    if not _rotation_fix_enabled:
+        return False
     if len(entries) < 2:
         return False
 

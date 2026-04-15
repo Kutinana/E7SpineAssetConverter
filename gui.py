@@ -24,7 +24,7 @@ from tkinter import (
 from sct2png import convert_sct_to_png
 from scsp2json import convert_scsp_to_json
 
-VERSION = "1.2.3b"
+VERSION = "1.2.4"
 _MAX_WORKERS = min(os.cpu_count() or 4, 8)
 
 # ==============================
@@ -49,6 +49,7 @@ STRINGS: dict[str, dict[str, str]] = {
     "recursive":          {"zh": "递归搜索子文件夹",               "en": "Search subfolders recursively"},
     "options":            {"zh": "选项",                           "en": "Options"},
     "fix_pma":            {"zh": "修复 Atlas pma 字段 (Spine 2.x 兼容)", "en": "Fix Atlas pma field (Spine 2.x compat)"},
+    "fix_rotation":       {"zh": "[实验性] 修复 180° 旋转偏移 (V2 骨骼动画)",    "en": "[Experimental] Fix 180° rotation offset (V2 skeletal anim)"},
     "log":                {"zh": "日志",                           "en": "Log"},
     "language":           {"zh": "语言",                           "en": "Language"},
     "warn":               {"zh": "提示",                           "en": "Warning"},
@@ -265,11 +266,14 @@ def _worker_convert_group(
     atlas_path: str,
     dest: str,
     fix_pma: bool,
+    fix_rot: bool = True,
 ) -> tuple[int, int, list[str], list[str]]:
     """Convert one group of files in a worker process.
 
     Returns ``(ok_count, total_count, failures, log_lines)``.
     """
+    from scsp_v2 import set_rotation_fix_enabled
+    set_rotation_fix_enabled(fix_rot)
     Path(dest).mkdir(parents=True, exist_ok=True)
     log_buf: list[str] = [f"━━ {stem} ━━"]
     failures: list[str] = []
@@ -328,6 +332,7 @@ class App:
         self.atlas_path = StringVar()
         self.out_dir = StringVar()
         self.fix_atlas_pma = BooleanVar(value=True)
+        self.fix_rotation = BooleanVar(value=True)
 
         self.batch_in_dir = StringVar()
         self.batch_out_dir = StringVar()
@@ -379,6 +384,7 @@ class App:
         ww["batch_btn"].configure(text=t("batch_convert"))
         ww["opt_frame"].configure(text=t("options"))
         ww["pma_cb"].configure(text=t("fix_pma"))
+        ww["rot_cb"].configure(text=t("fix_rotation"))
         ww["log_frame"].configure(text=t("log"))
         ww["lang_frame"].configure(text=t("language"))
 
@@ -498,6 +504,8 @@ class App:
         ww["opt_frame"] = opt_frame
         ww["pma_cb"] = ttk.Checkbutton(opt_frame, text=t("fix_pma"), variable=self.fix_atlas_pma)
         ww["pma_cb"].pack(anchor="w")
+        ww["rot_cb"] = ttk.Checkbutton(opt_frame, text=t("fix_rotation"), variable=self.fix_rotation)
+        ww["rot_cb"].pack(anchor="w")
 
         lang_frame = ttk.LabelFrame(bottom, text=t("language"), padding=8)
         lang_frame.grid(row=0, column=1, sticky="ns", padx=(8, 0))
@@ -682,7 +690,8 @@ class App:
 
         self._cancel_event.clear()
         self._set_buttons(DISABLED)
-        threading.Thread(target=self._do_convert, args=(sct, scsp, atlas, out), daemon=True).start()
+        fix_rot = self.fix_rotation.get()
+        threading.Thread(target=self._do_convert, args=(sct, scsp, atlas, out, fix_rot), daemon=True).start()
 
     def _convert_one_group(
         self, sct: str, scsp: str, atlas: str, out_dir: str,
@@ -799,7 +808,9 @@ class App:
             self._log(f"  • {f}")
         self._log("")
 
-    def _do_convert(self, sct: str, scsp: str, atlas: str, out_dir: str) -> None:
+    def _do_convert(self, sct: str, scsp: str, atlas: str, out_dir: str, fix_rot: bool = True) -> None:
+        from scsp_v2 import set_rotation_fix_enabled
+        set_rotation_fix_enabled(fix_rot)
         t0 = time.perf_counter()
         file_count = sum(1 for p in [sct, scsp, atlas] if p)
         done = [0]
@@ -869,10 +880,12 @@ class App:
             group_ok = 0
             all_failures: list[str] = []
             fix_pma = self.fix_atlas_pma.get()
+            fix_rot = self.fix_rotation.get()
 
             self._tb_progress(0, all_file_count)
 
-            with ProcessPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+            pool = ProcessPoolExecutor(max_workers=_MAX_WORKERS)
+            try:
                 future_map: dict = {}
                 for stem, file_map in groups.items():
                     if self._cancel_event.is_set():
@@ -897,6 +910,7 @@ class App:
                         atlas_p.as_posix() if atlas_p else "",
                         dest,
                         fix_pma,
+                        fix_rot,
                     )
                     future_map[fut] = stem
 
@@ -917,6 +931,8 @@ class App:
                         self._tb_progress(files_done, all_file_count)
                     except Exception:
                         traceback.print_exc()
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
 
             elapsed = self._fmt_elapsed(time.perf_counter() - t0)
             if self._cancel_event.is_set():

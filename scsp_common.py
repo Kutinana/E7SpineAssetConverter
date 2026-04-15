@@ -461,6 +461,7 @@ class SkeletonData:
     v2_event_count: int = 0
     v2_anim_count: int = 0
     v2_skin_records: List[Dict] = field(default_factory=list)
+    v2_has_magic: bool = False
     _v2_used_pool_offsets: Set[int] = field(default_factory=set)
 
 
